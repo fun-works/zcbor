@@ -40,7 +40,7 @@ void zcbor_new_encode_state(zcbor_state_t *state_array, size_t n_states,
  *  @param[in]  elem_count    The starting elem_count (typically 1).
  */
 #define ZCBOR_STATE_E(name, num_backups, payload, payload_size, elem_count) \
-zcbor_state_t name[((num_backups) + 2)]; \
+zcbor_state_t name[((num_backups) + ZCBOR_EXTRA_STATES)]; \
 do { \
 	zcbor_new_encode_state(name, ZCBOR_ARRAY_SIZE(name), payload, payload_size, elem_count); \
 } while(0)
@@ -105,16 +105,22 @@ bool zcbor_float64_encode(zcbor_state_t *state, const double *input); /* IEEE754
  * When all members have been encoded, call @ref zcbor_list_end_encode /
  * @ref zcbor_map_end_encode to close the list/map.
  *
- * @param[inout] state    The current state of the encoding.
- * @param[in]    max_num  The maximum number of members in the list/map.
- *                        This serves as a size hint for the header. Must be
- *                        equal to the max_num provided to the corresponding
- *                        @ref zcbor_list_end_encode / @ref zcbor_map_end_encode
- *                        call.
- *                        Only used when ZCBOR_CANONICAL is defined.
+ * @param[inout] state      The current state of the encoding.
+ * @param[in]    size_hint  A size hint for the header. Must be equal to the
+ *                          size_hint provided to the corresponding
+ *                          @ref zcbor_list_end_encode / @ref zcbor_map_end_encode call.
+ *                          The size_hint is ignored unless ZCBOR_CANONICAL is defined.
+ *                          The size_hint can be 0 if unknown or unneeded.
+ *                          The following is only relevant if ZCBOR_CANONICAL is defined:
+ *                          Note that using a smaller size_hint than the actual
+ *                          number of elements will introduce a new possible failure mode
+ *                          to the _end_encode function: Failing because the payload buffer
+ *                          is exhausted.
+ *                          With a correct or larger size_hint, the failure will instead
+ *                          happen while encoding an element.
  */
-bool zcbor_list_start_encode(zcbor_state_t *state, size_t max_num);
-bool zcbor_map_start_encode(zcbor_state_t *state, size_t max_num);
+bool zcbor_list_start_encode(zcbor_state_t *state, size_t size_hint);
+bool zcbor_map_start_encode(zcbor_state_t *state, size_t size_hint);
 
 /** Encode the end of a list/map. Do some checks and deallocate backup.
  *
@@ -127,15 +133,16 @@ bool zcbor_map_start_encode(zcbor_state_t *state, size_t max_num);
  * Use @ref zcbor_list_map_end_force_encode to forcibly consume the backup if
  * something has gone wrong.
  *
- * @param[inout] state    The current state of the encoding.
- * @param[in]    max_num  The maximum number of members in the list/map. Must be
- *                        equal to the max_num provided to the corresponding
- *                        @ref zcbor_list_start_encode call.
- *                        Only used when ZCBOR_CANONICAL is defined.
+ * See @ref zcbor_list_start_encode for param docs.
+ *
+ * @note If the call fails, The behavior depends on whether ZCBOR_CANONICAL is defined.
+ *       If enabled, the state is returned to how it was before the corresponding `*_start_encode` call.
+ *       If disabled, the state is left how it was before this call to `*_end_encode`.
  */
-bool zcbor_list_end_encode(zcbor_state_t *state, size_t max_num);
-bool zcbor_map_end_encode(zcbor_state_t *state, size_t max_num);
+bool zcbor_list_end_encode(zcbor_state_t *state, size_t size_hint);
+bool zcbor_map_end_encode(zcbor_state_t *state, size_t size_hint);
 bool zcbor_list_map_end_force_encode(zcbor_state_t *state);
+
 
 /** Encode 0 or more elements with the same type and constraints.
  *
@@ -240,6 +247,55 @@ bool zcbor_bstr_start_encode(zcbor_state_t *state);
  * Restore element count from backup.
  */
 bool zcbor_bstr_end_encode(zcbor_state_t *state, struct zcbor_string *result);
+bool zcbor_bstr_end_force_encode(zcbor_state_t *state);
+
+
+#ifdef ZCBOR_FRAGMENTS
+
+/** Start encoding a fragmented string. I.e. a string spread over non-consecutive payload sections.
+ *
+ * NOTE: The fragmented string API is experimental.
+ *
+ * After calling this, you can write a fragment with @ref zcbor_str_fragment_encode,
+ * then update the payload with @ref zcbor_update_state.
+ * Repeat until the string is fully encoded, then call @ref zcbor_bstr_fragments_end_encode.
+ */
+bool zcbor_bstr_fragments_start_encode(zcbor_state_t *state, size_t total_len);
+bool zcbor_tstr_fragments_start_encode(zcbor_state_t *state, size_t total_len);
+
+/** Start encoding a fragmented CBOR-encoded bytestring.
+ *
+ * I.e. a string spread over non-consecutive payload sections.
+ *
+ * NOTE: The fragmented string API is experimental.
+ *
+ * This is an alternative to zcbor_*str_fragments_start_encode() to be used if the payload
+ * contains CBOR data that will be encoded directly with other zcbor_*() functions.
+ *
+ * A state backup is created to keep track of the element count and original payload_end.
+ * After calling this, you can encode elements using other zcbor functions,
+ * then update the payload with @ref zcbor_update_state.
+ * Repeat until the string is fully encoded, then call @ref zcbor_bstr_fragments_end_encode.
+ * When the current payload section contains the end of the string,
+ * payload_end is set to the end of the string, so there is no risk of encoding past the end.
+ */
+bool zcbor_cbor_bstr_fragments_start_encode(zcbor_state_t *state, size_t total_len);
+
+/** Encode a string fragment.
+ *
+ * NOTE: The fragmented string API is experimental.
+ *
+ * Write bytes to the payload until either the end of the payload or the end of the fragment.
+ * The string must have been started with @ref zcbor_*str_fragments_start_encode.
+ * The number of bytes written is returned in @p enc_len.
+ * Do not use this function with @ref zcbor_cbor_bstr_fragments_start_encode.
+ */
+bool zcbor_str_fragment_encode(zcbor_state_t *state, struct zcbor_string *fragment, size_t *enc_len);
+
+/** Finish encoding a fragmented string. */
+bool zcbor_str_fragments_end_encode(zcbor_state_t *state);
+
+#endif /* ZCBOR_FRAGMENTS */
 
 #ifdef __cplusplus
 }

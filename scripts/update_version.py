@@ -16,7 +16,7 @@ p_MIGRATION_GUIDE = Path(p_root, "MIGRATION_GUIDE.md")
 p_common_h = Path(p_root, "include", "zcbor_common.h")
 
 RELEASE_NOTES_boilerplate = """
-Any new bugs, requests, or missing features should be reported as [Github issues](https://github.com/NordicSemiconductor/zcbor/issues).
+Any new bugs, requests, or missing features should be reported as [Github issues](https://github.com/nordicsemi/zcbor/issues).
 
 ## Improvements:
 
@@ -41,7 +41,7 @@ if __name__ == "__main__":
         print(f"Usage: {argv[0]} <new zcbor version>")
         exit(1)
     version = argv[1]
-    (major, minor, bugfix) = version.split(".")
+    major, minor, bugfix = version.split(".")
 
     p_VERSION.write_text(version, encoding="utf-8")
     update_relnotes(p_RELEASE_NOTES, version, boilerplate=RELEASE_NOTES_boilerplate)

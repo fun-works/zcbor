@@ -41,11 +41,42 @@ static bool initial_checks(zcbor_state_t *state)
 }
 
 
+#ifdef ZCBOR_FRAGMENTS
+static bool initial_checks_w_frags(zcbor_state_t *state)
+{
+	ZCBOR_FAIL_IF(!initial_checks(state));
+	ZCBOR_ERR_IF(state->inside_frag_str, ZCBOR_ERR_INSIDE_STRING);
+	return true;
+}
+
+#define INITIAL_CHECKS_INSIDE_FRAG_STR() \
+do {\
+	if (!initial_checks(state)) { \
+		ZCBOR_FAIL(); \
+	} \
+} while(0)
+
+#define INITIAL_CHECKS() \
+do {\
+	if (!initial_checks_w_frags(state)) { \
+		ZCBOR_FAIL(); \
+	} \
+} while(0)
+
+#else
+
+#define INITIAL_CHECKS() \
+do {\
+	if (!initial_checks(state)) { \
+		ZCBOR_FAIL(); \
+	} \
+} while(0)
+#endif
+
+
 static bool type_check(zcbor_state_t *state, zcbor_major_type_t exp_major_type)
 {
-	if (!initial_checks(state)) {
-		ZCBOR_FAIL();
-	}
+	INITIAL_CHECKS();
 	zcbor_major_type_t major_type = ZCBOR_MAJOR_TYPE(*state->payload);
 
 	if (major_type != exp_major_type) {
@@ -54,14 +85,6 @@ static bool type_check(zcbor_state_t *state, zcbor_major_type_t exp_major_type)
 	return true;
 }
 
-
-#define INITIAL_CHECKS() \
-do {\
-	if (!initial_checks(state)) { \
-		ZCBOR_FAIL(); \
-	} \
-} while(0)
-
 #define INITIAL_CHECKS_WITH_TYPE(exp_major_type) \
 do {\
 	if (!type_check(state, exp_major_type)) { \
@@ -69,26 +92,23 @@ do {\
 	} \
 } while(0)
 
-static void err_restore(zcbor_state_t *state, int err)
+static void restore(zcbor_state_t *state)
 {
 	state->payload = state->payload_bak;
 	state->elem_count++;
-	zcbor_error(state, err);
 }
 
 #define ERR_RESTORE(err) \
 do { \
-	err_restore(state, err); \
-	ZCBOR_FAIL(); \
+	restore(state); \
+	ZCBOR_ERR(err); \
 } while(0)
 
 #define FAIL_RESTORE() \
 do { \
-	state->payload = state->payload_bak; \
-	state->elem_count++; \
+	restore(state); \
 	ZCBOR_FAIL(); \
 } while(0)
-
 
 static void endian_copy(uint8_t *dst, const uint8_t *src, size_t src_len)
 {
@@ -597,21 +617,25 @@ static bool exit_map(zcbor_state_t *state)
 {
 #ifdef ZCBOR_MAP_SMART_SEARCH
 	/* This has no effect if we are not in an unordered map, since map_elem_count is 0. */
-	uint8_t *new_elem_state = state->decode_state.map_search_elem_state
-		+ zcbor_flags_to_bytes(state->decode_state.map_elem_count);
+	size_t elem_state_size = (size_t)state->constant_state->map_search_elem_state_end
+		- (size_t)state->decode_state.map_search_elem_state;
+	size_t new_flags = zcbor_flags_to_bytes(state->decode_state.map_elem_count);
 
-	if (new_elem_state > state->constant_state->map_search_elem_state_end) {
+	if (new_flags > elem_state_size) {
 		zcbor_log("map_search_elem_state overflowed!\r\n");
 		ZCBOR_ERR(ZCBOR_ERR_MAP_FLAGS_NOT_AVAILABLE);
 	}
 
-	state->decode_state.map_search_elem_state = new_elem_state;
+	state->decode_state.map_search_elem_state += new_flags;
 #else
 	state->decode_state.map_elems_processed = 0;
 #endif
 	state->decode_state.map_elem_count = 0;
 	return true;
 }
+
+
+static bool exit_backup(zcbor_state_t *state, bool skip_check_error, bool *backup_exited);
 
 
 bool zcbor_bstr_start_decode(zcbor_state_t *state, struct zcbor_string *result)
@@ -629,21 +653,72 @@ bool zcbor_bstr_start_decode(zcbor_state_t *state, struct zcbor_string *result)
 	if (!zcbor_new_backup(state, ZCBOR_MAX_ELEM_COUNT)) {
 		FAIL_RESTORE();
 	}
-	ZCBOR_FAIL_IF(!exit_map(state)); // Exit the enclosing map if any
+
+	// Exit the enclosing map if any
+	if (!exit_map(state)) {
+		bool backup_exited = false;
+
+		exit_backup(state, true, &backup_exited);
+		ZCBOR_FAIL_IF(!backup_exited);
+		FAIL_RESTORE();
+	}
 
 	state->payload_end = result->value + result->len;
+	state->inside_cbor_bstr = true;
+
 	return true;
 }
 
 
-bool zcbor_bstr_end_decode(zcbor_state_t *state)
+static bool exit_backup(zcbor_state_t *state, bool skip_check_error, bool *backup_exited)
 {
+	if (backup_exited != NULL) {
+		*backup_exited = false;
+	}
+
 	ZCBOR_CHECK_NULL(state);
-	ZCBOR_ERR_IF(state->payload != state->payload_end, ZCBOR_ERR_PAYLOAD_NOT_CONSUMED);
+	ZCBOR_ERR_IF(!state->constant_state, ZCBOR_ERR_CONSTANT_STATE_MISSING);
+
+	size_t backup_num = zcbor_get_backup_num(state);
+
+	bool fail = false;
+
+#ifdef ZCBOR_STOP_ON_ERROR
+	int err_backup = ZCBOR_SUCCESS;
+
+	/* zcbor_process_backup() refuses to run while an error is registered, so stash the
+	 * error across the call and restore it afterwards. Only stop_on_error makes
+	 * zcbor_process_backup() care about the error. */
+	if (skip_check_error && !zcbor_check_error(state)) {
+		err_backup = zcbor_pop_error(state);
+	}
+#else
+	(void)skip_check_error;
+#endif
 
 	if (!zcbor_process_backup(state,
 			ZCBOR_FLAG_RESTORE | ZCBOR_FLAG_CONSUME | ZCBOR_FLAG_KEEP_PAYLOAD,
 			ZCBOR_MAX_ELEM_COUNT)) {
+		zcbor_log("zcbor_process_backup() failed: %d.\r\n", zcbor_peek_error(state));
+		fail = true;
+	}
+
+	/* The backup is exited at this point, update immediately */
+	if (backup_exited != NULL) {
+		*backup_exited = (zcbor_get_backup_num(state) == (backup_num - 1));
+	}
+
+#ifdef ZCBOR_STOP_ON_ERROR
+	if (err_backup != ZCBOR_SUCCESS) {
+		/* Report the stashed error (if present) rather than the one from
+		 * zcbor_process_backup(), since the stashed one is the root cause. */
+		(void)zcbor_pop_error(state);
+		zcbor_error(state, err_backup);
+		fail = true;
+	}
+#endif
+
+	if (fail) {
 		ZCBOR_FAIL();
 	}
 
@@ -651,80 +726,139 @@ bool zcbor_bstr_end_decode(zcbor_state_t *state)
 }
 
 
-static void partition_fragment(const zcbor_state_t *state,
-	struct zcbor_string_fragment *result)
-{
-	result->fragment.len = MIN(result->fragment.len,
-		(size_t)state->payload_end - (size_t)state->payload);
-}
+#define EXIT_BACKUP_IF_FORCE(state, force, skip_check_error) \
+	ZCBOR_FAIL_IF(force && !exit_backup(state, skip_check_error, NULL))
 
 
-static bool start_decode_fragment(zcbor_state_t *state,
-	struct zcbor_string_fragment *result,
-	zcbor_major_type_t exp_major_type)
+bool zcbor_bstr_end_decode(zcbor_state_t *state, bool force)
 {
 	ZCBOR_PRINT_FUNC_NAME();
-	if(!str_start_decode(state, &result->fragment, exp_major_type)) {
+	ZCBOR_CHECK_NULL(state);
+	ZCBOR_CHECK_ERROR();
+
+	if (state->payload != state->payload_end){
+		EXIT_BACKUP_IF_FORCE(state, force, false);
+		ZCBOR_ERR(ZCBOR_ERR_PAYLOAD_NOT_CONSUMED);
+	}
+	return exit_backup(state, false, NULL);
+}
+
+
+#ifdef ZCBOR_FRAGMENTS
+
+static bool start_decode_fragments(zcbor_state_t *state,
+	zcbor_major_type_t exp_major_type, bool cbor_bstr)
+{
+	struct zcbor_string string_hdr;
+
+	if(!str_start_decode(state, &string_hdr, exp_major_type)) {
 		ZCBOR_FAIL();
 	}
 
-	result->offset = 0;
-	result->total_len = result->fragment.len;
-	partition_fragment(state, result);
-	state->payload_end = state->payload + result->fragment.len;
+	if (state->inside_cbor_bstr) {
+		size_t remainder;
+
+		if (!zcbor_current_string_remainder(state, &remainder)) {
+			FAIL_RESTORE();
+		}
+		if (remainder < string_hdr.len) {
+			ERR_RESTORE(ZCBOR_ERR_TOO_LARGE_FOR_STRING);
+		}
+	}
+
+	ptrdiff_t new_offset = state->constant_state->curr_payload_section - state->payload;
+
+	if (cbor_bstr) {
+		if (!zcbor_new_backup(state, ZCBOR_MAX_ELEM_COUNT)) {
+			FAIL_RESTORE();
+		}
+		state->frag_offset_cbor = new_offset;
+		state->str_total_len_cbor = string_hdr.len;
+		state->inside_cbor_bstr = true;
+	} else {
+		state->frag_offset = new_offset;
+		state->str_total_len = string_hdr.len;
+		state->inside_frag_str = true;
+	}
 
 	return true;
 }
 
-bool zcbor_bstr_start_decode_fragment(zcbor_state_t *state,
-	struct zcbor_string_fragment *result)
+
+bool zcbor_bstr_fragments_start_decode(zcbor_state_t *state)
 {
 	ZCBOR_PRINT_FUNC_NAME();
-	if (!start_decode_fragment(state, result, ZCBOR_MAJOR_TYPE_BSTR)) {
-		ZCBOR_FAIL();
+	return start_decode_fragments(state, ZCBOR_MAJOR_TYPE_BSTR, false);
+}
+
+
+bool zcbor_tstr_fragments_start_decode(zcbor_state_t *state)
+{
+	ZCBOR_PRINT_FUNC_NAME();
+	return start_decode_fragments(state, ZCBOR_MAJOR_TYPE_TSTR, false);
+}
+
+
+bool zcbor_cbor_bstr_fragments_start_decode(zcbor_state_t *state)
+{
+	ZCBOR_PRINT_FUNC_NAME();
+	return start_decode_fragments(state, ZCBOR_MAJOR_TYPE_BSTR, true);
+}
+
+
+bool zcbor_str_fragment_decode(zcbor_state_t *state, struct zcbor_string_fragment *fragment)
+{
+	ZCBOR_PRINT_FUNC_NAME();
+	INITIAL_CHECKS_INSIDE_FRAG_STR();
+
+	size_t len, offset, remainder;
+
+	ZCBOR_FAIL_IF(!zcbor_current_string_offset(state, &offset));
+	ZCBOR_FAIL_IF(!zcbor_current_string_remainder(state, &remainder));
+
+	if (state->inside_frag_str) {
+		len = MIN((size_t)state->payload_end - (size_t)state->payload, remainder);
+		state->payload += len;
+		fragment->total_len = state->str_total_len;
+		fragment->offset = offset;
+
+	} else {
+		len = MIN((size_t)state->payload - (size_t)state->constant_state->curr_payload_section,
+					offset);
+		fragment->total_len = state->str_total_len_cbor;
+		fragment->offset = offset - len;
 	}
-	if (!zcbor_new_backup(state, ZCBOR_MAX_ELEM_COUNT)) {
-		FAIL_RESTORE();
-	}
+
+	fragment->fragment.value = state->payload - len;
+	fragment->fragment.len = len;
+
+	zcbor_log("\r\n");
 	return true;
 }
 
 
-void zcbor_next_fragment(zcbor_state_t *state,
-	struct zcbor_string_fragment *prev_fragment,
-	struct zcbor_string_fragment *result)
+bool zcbor_str_fragments_end_decode(zcbor_state_t *state)
 {
-	memcpy(result, prev_fragment, sizeof(*result));
-	result->fragment.value = state->payload_mut;
-	result->offset += prev_fragment->fragment.len;
-	result->fragment.len = result->total_len - result->offset;
+	ZCBOR_PRINT_FUNC_NAME();
 
-	partition_fragment(state, result);
-	zcbor_log("New fragment length %zu\r\n", result->fragment.len);
+	size_t remainder;
 
-	state->payload += result->fragment.len;
+	ZCBOR_FAIL_IF(!zcbor_current_string_remainder(state, &remainder));
+	ZCBOR_ERR_IF(remainder != 0, ZCBOR_ERR_NOT_AT_END);
+
+	if (state->inside_frag_str) {
+		state->inside_frag_str = false;
+	} else {
+		if (!zcbor_bstr_end_decode(state, false)) {
+			ZCBOR_FAIL();
+		}
+		state->inside_cbor_bstr = false;
+	}
+
+	return true;
 }
 
-
-void zcbor_bstr_next_fragment(zcbor_state_t *state,
-	struct zcbor_string_fragment *prev_fragment,
-	struct zcbor_string_fragment *result)
-{
-	memcpy(result, prev_fragment, sizeof(*result));
-	result->fragment.value = state->payload_mut;
-	result->offset += prev_fragment->fragment.len;
-	result->fragment.len = result->total_len - result->offset;
-
-	partition_fragment(state, result);
-	zcbor_log("fragment length %zu\r\n", result->fragment.len);
-	state->payload_end = state->payload + result->fragment.len;
-}
-
-
-bool zcbor_is_last_fragment(const struct zcbor_string_fragment *fragment)
-{
-	return (fragment->total_len == (fragment->offset + fragment->fragment.len));
-}
+#endif /* ZCBOR_FRAGMENTS */
 
 
 static bool str_decode(zcbor_state_t *state, struct zcbor_string *result,
@@ -735,18 +869,6 @@ static bool str_decode(zcbor_state_t *state, struct zcbor_string *result,
 	}
 
 	state->payload += result->len;
-	return true;
-}
-
-
-static bool str_decode_fragment(zcbor_state_t *state, struct zcbor_string_fragment *result,
-		zcbor_major_type_t exp_major_type)
-{
-	if (!start_decode_fragment(state, result, exp_major_type)) {
-		ZCBOR_FAIL();
-	}
-
-	(state->payload) += result->fragment.len;
 	return true;
 }
 
@@ -773,13 +895,6 @@ bool zcbor_bstr_decode(zcbor_state_t *state, struct zcbor_string *result)
 }
 
 
-bool zcbor_bstr_decode_fragment(zcbor_state_t *state, struct zcbor_string_fragment *result)
-{
-	ZCBOR_PRINT_FUNC_NAME();
-	return str_decode_fragment(state, result, ZCBOR_MAJOR_TYPE_BSTR);
-}
-
-
 bool zcbor_bstr_expect(zcbor_state_t *state, struct zcbor_string *expected)
 {
 	ZCBOR_PRINT_FUNC_NAME();
@@ -791,13 +906,6 @@ bool zcbor_tstr_decode(zcbor_state_t *state, struct zcbor_string *result)
 {
 	ZCBOR_PRINT_FUNC_NAME();
 	return str_decode(state, result, ZCBOR_MAJOR_TYPE_TSTR);
-}
-
-
-bool zcbor_tstr_decode_fragment(zcbor_state_t *state, struct zcbor_string_fragment *result)
-{
-	ZCBOR_PRINT_FUNC_NAME();
-	return str_decode_fragment(state, result, ZCBOR_MAJOR_TYPE_TSTR);
 }
 
 
@@ -856,11 +964,18 @@ static bool list_map_start_decode(zcbor_state_t *state,
 				? ZCBOR_LARGE_ELEM_COUNT : new_elem_count)) {
 		FAIL_RESTORE();
 	}
-	state->decode_state.map_start_backup_num = state->constant_state->current_backup;
+	state->decode_state.map_start_backup_num = zcbor_get_backup_num(state);
 
 	state->decode_state.indefinite_length_array = indefinite_length_array;
 
-	ZCBOR_FAIL_IF(!exit_map(state)); // Exit the enclosing map if any
+	// Exit the enclosing map if any
+	if (!exit_map(state)) {
+		bool backup_exited = false;
+
+		exit_backup(state, true, &backup_exited);
+		ZCBOR_FAIL_IF(!backup_exited);
+		FAIL_RESTORE();
+	}
 
 	return true;
 }
@@ -880,7 +995,10 @@ bool zcbor_map_start_decode(zcbor_state_t *state)
 
 	if (ret && !state->decode_state.indefinite_length_array) {
 		if (state->elem_count >= (ZCBOR_MAX_ELEM_COUNT / 2)) {
-			/* The new elem_count is too large. */
+			bool backup_exited = false;
+
+			exit_backup(state, false, &backup_exited);
+			ZCBOR_FAIL_IF(!backup_exited);
 			ERR_RESTORE(ZCBOR_ERR_INT_SIZE);
 		}
 		state->elem_count *= 2;
@@ -1025,12 +1143,12 @@ static bool allocate_map_flags(zcbor_state_t *state, size_t old_flags)
 	size_t extra_bytes = new_bytes - old_bytes;
 
 	ZCBOR_ERR_IF(!state->constant_state, ZCBOR_ERR_CONSTANT_STATE_MISSING);
-	const uint8_t *flags_end = state->constant_state->map_search_elem_state_end;
+	size_t elem_state_size = (size_t)state->constant_state->map_search_elem_state_end
+		- (size_t)state->decode_state.map_search_elem_state;
 
 	if (extra_bytes) {
-		if ((state->decode_state.map_search_elem_state + new_bytes) > flags_end) {
-			state->decode_state.map_elem_count
-				= 8 * (size_t)(flags_end - state->decode_state.map_search_elem_state);
+		if (elem_state_size < new_bytes) {
+			state->decode_state.map_elem_count = 8 * elem_state_size;
 			ZCBOR_ERR(ZCBOR_ERR_MAP_FLAGS_NOT_AVAILABLE);
 		}
 
@@ -1102,9 +1220,11 @@ bool zcbor_unordered_map_search(zcbor_decoder_t key_decoder, zcbor_state_t *stat
 
 	uint8_t const *payload_bak = state->payload;
 	size_t elem_count = state->elem_count;
+	size_t backup_num = zcbor_get_backup_num(state);
 
 	/* Loop once through all the elements of the map. */
 	do {
+		ZCBOR_ERR_IF(zcbor_get_backup_num(state) != backup_num, ZCBOR_ERR_BACKUP_MISMATCH);
 		if (zcbor_array_at_end(state)) {
 			if (!handle_map_end(state)) {
 				goto error;
@@ -1124,11 +1244,13 @@ bool zcbor_unordered_map_search(zcbor_decoder_t key_decoder, zcbor_state_t *stat
 
 		if (should_try_key(state)) {
 			if (try_key(state, key_result, key_decoder)) {
+				ZCBOR_ERR_IF(zcbor_get_backup_num(state) != backup_num, ZCBOR_ERR_BACKUP_MISMATCH);
 				if (!ZCBOR_MANUALLY_PROCESS_ELEM(state)) {
 					ZCBOR_FAIL_IF(!zcbor_elem_processed(state));
 				}
 				return true;
 			}
+			ZCBOR_ERR_IF(zcbor_get_backup_num(state) != backup_num, ZCBOR_ERR_BACKUP_MISMATCH);
 		} else {
 			zcbor_log("Skipping element at index %zu.\n", get_current_index(state, 0));
 		}
@@ -1185,60 +1307,58 @@ static bool array_end_expect(zcbor_state_t *state)
 }
 
 
-static bool list_map_end_decode(zcbor_state_t *state)
+static bool list_map_end_decode(zcbor_state_t *state, bool force)
 {
 	ZCBOR_CHECK_NULL(state);
 
-	zcbor_state_t state_copy = *state;
-
-	if (!zcbor_process_backup(state,
-			ZCBOR_FLAG_RESTORE | ZCBOR_FLAG_CONSUME | ZCBOR_FLAG_KEEP_PAYLOAD,
-			ZCBOR_MAX_ELEM_COUNT)) {
-		ZCBOR_FAIL();
-	}
-
-	if (state_copy.decode_state.indefinite_length_array) {
+	if (state->decode_state.indefinite_length_array) {
 		if (!array_end_expect(state)) {
+			/* Call EXIT_BACKUP_IF_FORCE with skip_check_error=true so it will
+			 * complete correctly even though array_end_expect() failed. */
+			EXIT_BACKUP_IF_FORCE(state, force, true);
 			ZCBOR_FAIL();
 		}
-		state_copy.decode_state.indefinite_length_array = false;
+		state->decode_state.indefinite_length_array = false;
 	} else {
-		if (state_copy.elem_count > 0) {
-			zcbor_log("%zu elements left in map or array (should be 0).\r\n", state_copy.elem_count);
+		if (state->elem_count > 0) {
+			zcbor_log("%zu elements left in map or array (should be 0).\r\n", state->elem_count);
+			EXIT_BACKUP_IF_FORCE(state, force, false);
 			ZCBOR_ERR(ZCBOR_ERR_HIGH_ELEM_COUNT);
 		}
 	}
 
-	return true;
+	return exit_backup(state, false, NULL);
 }
 
 
-bool zcbor_list_end_decode(zcbor_state_t *state)
+bool zcbor_list_end_decode(zcbor_state_t *state, bool force)
 {
 	ZCBOR_PRINT_FUNC_NAME();
-	return list_map_end_decode(state);
+	return list_map_end_decode(state, force);
 }
 
 
-bool zcbor_map_end_decode(zcbor_state_t *state)
+bool zcbor_map_end_decode(zcbor_state_t *state, bool force)
 {
 	ZCBOR_PRINT_FUNC_NAME();
-	return list_map_end_decode(state);
+	return list_map_end_decode(state, force);
 }
 
 
-bool zcbor_unordered_map_end_decode(zcbor_state_t *state)
+bool zcbor_unordered_map_end_decode(zcbor_state_t *state, bool force)
 {
 	ZCBOR_PRINT_FUNC_NAME();
-	/* Checking zcbor_array_at_end() ensures that check is valid.
-	 * In case the map is at the end, but state->decode_state.counting_map_elems isn't updated.*/
+	bool err_not_processed = false;
+
 	if (!zcbor_array_at_end(state) && state->decode_state.counting_map_elems) {
+		/* The first traversal of the map is not complete,
+		 * i.e. some elements are not processed. */
 		zcbor_log("unprocessed element(s) in map after index %zu\n",
 				state->decode_state.map_elem_count);
-		ZCBOR_ERR(ZCBOR_ERR_ELEMS_NOT_PROCESSED);
+		err_not_processed = true;
 	}
 
-	if (state->decode_state.map_elem_count > 0) {
+	if (!err_not_processed && (state->decode_state.map_elem_count > 0)) {
 #ifdef ZCBOR_MAP_SMART_SEARCH
 		manipulate_flags(state, FLAG_MODE_CLEAR_UNUSED);
 
@@ -1246,29 +1366,55 @@ bool zcbor_unordered_map_end_decode(zcbor_state_t *state)
 			if (state->decode_state.map_search_elem_state[i] != 0) {
 				zcbor_log("unprocessed element(s) in map: [%zu] = 0x%02x\n",
 						i, state->decode_state.map_search_elem_state[i]);
-				ZCBOR_ERR(ZCBOR_ERR_ELEMS_NOT_PROCESSED);
+				err_not_processed = true;
 			}
 		}
 #else
-		ZCBOR_ERR_IF(should_try_key(state), ZCBOR_ERR_ELEMS_NOT_PROCESSED);
+
+		if (should_try_key(state)) {
+			zcbor_log("unprocessed element(s) in map\n");
+			err_not_processed = true;
+		}
 #endif
 	}
-	while (!zcbor_array_at_end(state)) {
-		zcbor_any_skip(state, NULL);
+
+	if (err_not_processed) {
+		EXIT_BACKUP_IF_FORCE(state, force, false);
+		ZCBOR_ERR(ZCBOR_ERR_ELEMS_NOT_PROCESSED);
 	}
-	return zcbor_map_end_decode(state);
+
+	while (!zcbor_array_at_end(state)) {
+		if (!zcbor_any_skip(state, NULL)) {
+			/* Shouldn't really come here, because all map elements should have been
+			 * successfully decoded earlier using zcbor_unordered_map_search().
+			 * If the first pass of the map was not finished, the current function
+			 * should have errored earlier.
+			 * If we got here, an element was successfully decoded earlier using some
+			 * function, but then failed now in zcbor_any_skip().
+			 */
+			zcbor_log("Could not move to end of map. zcbor_any_skip() returned %d\n", zcbor_peek_error(state));
+			/* Call EXIT_BACKUP_IF_FORCE with skip_check_error=true so it will
+			 * complete correctly even though zcbor_any_skip() failed. */
+			EXIT_BACKUP_IF_FORCE(state, force, true);
+			ZCBOR_ERR(ZCBOR_ERR_BAD_STATE);
+		}
+	}
+
+	return zcbor_map_end_decode(state, force);
 }
 
 
 bool zcbor_list_map_end_force_decode(zcbor_state_t *state)
 {
-	if (!zcbor_process_backup(state,
-			ZCBOR_FLAG_RESTORE | ZCBOR_FLAG_CONSUME | ZCBOR_FLAG_KEEP_PAYLOAD,
-			ZCBOR_MAX_ELEM_COUNT)) {
-		ZCBOR_FAIL();
-	}
+	ZCBOR_PRINT_FUNC_NAME();
+	return exit_backup(state, false, NULL);
+}
 
-	return true;
+
+bool zcbor_bstr_end_force_decode(zcbor_state_t *state)
+{
+	ZCBOR_PRINT_FUNC_NAME();
+	return exit_backup(state, false, NULL);
 }
 
 
@@ -1663,7 +1809,7 @@ bool zcbor_any_skip(zcbor_state_t *state, void *result)
 		case ZCBOR_MAJOR_TYPE_BSTR:
 		case ZCBOR_MAJOR_TYPE_TSTR:
 			/* 'value' is the length of the BSTR or TSTR. */
-			ZCBOR_FAIL_IF(!str_overflow_check(state, (size_t)value));
+			ZCBOR_FAIL_IF(!str_overflow_check(&state_copy, (size_t)value));
 			(state_copy.payload) += value;
 			break;
 		case ZCBOR_MAJOR_TYPE_MAP:
@@ -1719,7 +1865,8 @@ bool zcbor_tag_expect(zcbor_state_t *state, uint32_t expected)
 		ZCBOR_FAIL();
 	}
 	if (actual != expected) {
-		ERR_RESTORE(ZCBOR_ERR_WRONG_VALUE);
+		state->payload = state->payload_bak;
+		ZCBOR_ERR(ZCBOR_ERR_WRONG_VALUE);
 	}
 	return true;
 }
@@ -1732,6 +1879,72 @@ bool zcbor_tag_pexpect(zcbor_state_t *state, uint32_t *expected)
 }
 
 
+static bool multi_decode_backup(size_t min_decode,
+		size_t max_decode,
+		size_t *num_decode,
+		zcbor_decoder_t decoder,
+		zcbor_state_t *state,
+		void *result,
+		size_t result_len,
+		bool backup)
+{
+	ZCBOR_PRINT_FUNC_NAME();
+	ZCBOR_CHECK_NULL(state);
+	ZCBOR_CHECK_ERROR();
+
+	for (size_t i = 0; i < max_decode; i++) {
+		uint8_t const *payload_bak;
+		size_t elem_count_bak;
+		size_t backup_num_outer = zcbor_get_backup_num(state);
+
+		if (backup) {
+			if (!zcbor_new_backup_w_elem_state(state, state->elem_count, true)) {
+				ZCBOR_FAIL();
+			}
+		} else {
+			payload_bak = state->payload;
+			elem_count_bak = state->elem_count;
+		}
+
+		size_t backup_num_inner = zcbor_get_backup_num(state);
+
+		if (!decoder(state, (uint8_t *)result + i*result_len)) {
+			ZCBOR_ERR_IF(zcbor_get_backup_num(state) != backup_num_inner, ZCBOR_ERR_BACKUP_MISMATCH);
+
+			*num_decode = i;
+
+			if (backup) {
+				if (!zcbor_process_backup(state,
+						ZCBOR_FLAG_CONSUME | ZCBOR_FLAG_RESTORE,
+						ZCBOR_MAX_ELEM_COUNT)) {
+					ZCBOR_FAIL();
+				}
+			} else {
+				state->payload = payload_bak;
+				state->elem_count = elem_count_bak;
+			}
+			ZCBOR_ERR_IF(zcbor_get_backup_num(state) != backup_num_outer, ZCBOR_ERR_BACKUP_MISMATCH);
+
+			zcbor_log("Found %zu elements.\r\n", i);
+			ZCBOR_ERR_IF(i < min_decode, ZCBOR_ERR_ITERATIONS);
+			return true;
+		}
+
+		ZCBOR_ERR_IF(zcbor_get_backup_num(state) != backup_num_inner, ZCBOR_ERR_BACKUP_MISMATCH);
+
+		if (backup) {
+			if (!zcbor_process_backup(state, ZCBOR_FLAG_CONSUME, ZCBOR_MAX_ELEM_COUNT)) {
+				ZCBOR_FAIL();
+			}
+		}
+		ZCBOR_ERR_IF(zcbor_get_backup_num(state) != backup_num_outer, ZCBOR_ERR_BACKUP_MISMATCH);
+	}
+	zcbor_log("Found %zu elements.\r\n", max_decode);
+	*num_decode = max_decode;
+	return true;
+}
+
+
 bool zcbor_multi_decode(size_t min_decode,
 		size_t max_decode,
 		size_t *num_decode,
@@ -1741,26 +1954,19 @@ bool zcbor_multi_decode(size_t min_decode,
 		size_t result_len)
 {
 	ZCBOR_PRINT_FUNC_NAME();
-	ZCBOR_CHECK_NULL(state);
-	ZCBOR_CHECK_ERROR();
-	for (size_t i = 0; i < max_decode; i++) {
-		uint8_t const *payload_bak = state->payload;
-		size_t elem_count_bak = state->elem_count;
+	return multi_decode_backup(min_decode, max_decode, num_decode, decoder, state, result, result_len, false);
+}
 
-		if (!decoder(state,
-				(uint8_t *)result + i*result_len)) {
-			*num_decode = i;
-			state->payload = payload_bak;
-			state->elem_count = elem_count_bak;
-
-			zcbor_log("Found %zu elements.\r\n", i);
-			ZCBOR_ERR_IF(i < min_decode, ZCBOR_ERR_ITERATIONS);
-			return true;
-		}
-	}
-	zcbor_log("Found %zu elements.\r\n", max_decode);
-	*num_decode = max_decode;
-	return true;
+bool zcbor_multi_decode_w_backup(size_t min_decode,
+		size_t max_decode,
+		size_t *num_decode,
+		zcbor_decoder_t decoder,
+		zcbor_state_t *state,
+		void *result,
+		size_t result_len)
+{
+	ZCBOR_PRINT_FUNC_NAME();
+	return multi_decode_backup(min_decode, max_decode, num_decode, decoder, state, result, result_len, true);
 }
 
 
@@ -1772,9 +1978,23 @@ bool zcbor_present_decode(bool *present,
 	ZCBOR_PRINT_FUNC_NAME();
 	ZCBOR_CHECK_NULL(state);
 	size_t num_decode = 0;
-	bool retval = zcbor_multi_decode(0, 1, &num_decode, decoder, state, result, 0);
+	bool retval = multi_decode_backup(0, 1, &num_decode, decoder, state, result, 0, false);
 
 	zcbor_assert_state(retval, "zcbor_multi_decode should not fail with these parameters.\r\n");
+
+	*present = !!num_decode;
+	return retval;
+}
+
+
+bool zcbor_present_decode_w_backup(bool *present,
+		zcbor_decoder_t decoder,
+		zcbor_state_t *state,
+		void *result)
+{
+	ZCBOR_PRINT_FUNC_NAME();
+	size_t num_decode = 0;
+	bool retval = multi_decode_backup(0, 1, &num_decode, decoder, state, result, 0, true);
 
 	*present = !!num_decode;
 	return retval;

@@ -49,6 +49,10 @@ static bool encode_header_byte(zcbor_state_t *state,
 
 	zcbor_assert_state(additional < 32, "Unsupported additional value: %d\r\n", additional);
 
+#ifdef ZCBOR_FRAGMENTS
+	ZCBOR_ERR_IF(state->inside_frag_str, ZCBOR_ERR_INSIDE_STRING);
+#endif
+
 	*(state->payload_mut) = (uint8_t)((major_type << 5) | (additional & 0x1F));
 	zcbor_trace(state, "value_encode");
 	state->payload_mut++;
@@ -62,6 +66,7 @@ static bool value_encode_len(zcbor_state_t *state, zcbor_major_type_t major_type
 		const void *const result, size_t result_len)
 {
 	ZCBOR_CHECK_NULL(state);
+	ZCBOR_ERR_IF(result == NULL, ZCBOR_ERR_BAD_ARG);
 
 	uint8_t *u8_result  = (uint8_t *)result;
 
@@ -91,9 +96,15 @@ static bool value_encode_len(zcbor_state_t *state, zcbor_major_type_t major_type
 static bool value_encode(zcbor_state_t *state, zcbor_major_type_t major_type,
 		const void *const input, size_t max_result_len)
 {
+	ZCBOR_CHECK_NULL(state);
 	zcbor_assert_state(max_result_len != 0, "0-length result not supported.\r\n");
 
-	size_t result_len = zcbor_header_len_ptr(input, max_result_len) - 1;
+	size_t header_len = zcbor_header_len_ptr(input, max_result_len);
+
+	/* zcbor_header_len_ptr() returns 0 if @p input is NULL or @p max_result_len is too big. */
+	ZCBOR_ERR_IF(header_len == 0, ZCBOR_ERR_BAD_ARG);
+
+	size_t result_len = header_len - 1;
 	const void *result = input;
 
 #ifdef ZCBOR_BIG_ENDIAN
@@ -111,6 +122,9 @@ bool zcbor_int_encode(zcbor_state_t *state, const void *input_int, size_t int_si
 	const uint8_t *input_uint8 = input_int;
 	const int8_t *input_int8 = input_int;
 	const uint8_t *input = input_int;
+
+	ZCBOR_CHECK_NULL(state);
+	ZCBOR_ERR_IF(input_int == NULL, ZCBOR_ERR_BAD_ARG);
 
 	if (int_size > sizeof(int64_t)) {
 		ZCBOR_ERR(ZCBOR_ERR_INT_SIZE);
@@ -245,12 +259,24 @@ bool zcbor_size_encode(zcbor_state_t *state, const size_t *input)
 static bool str_start_encode(zcbor_state_t *state,
 		const struct zcbor_string *input, zcbor_major_type_t major_type)
 {
-	if (input->value && ((zcbor_header_len_ptr(&input->len, sizeof(input->len))
+	if (input->value && ((zcbor_header_len(input->len)
 			+ input->len + (size_t)state->payload)
 			> (size_t)state->payload_end)) {
 		ZCBOR_ERR(ZCBOR_ERR_NO_PAYLOAD);
 	}
 	if (!value_encode(state, major_type, &input->len, sizeof(input->len))) {
+		ZCBOR_FAIL();
+	}
+
+	return true;
+}
+
+
+static bool exit_backup(zcbor_state_t *state)
+{
+	ZCBOR_CHECK_NULL(state);
+
+	if (!zcbor_process_backup(state, ZCBOR_FLAG_RESTORE | ZCBOR_FLAG_CONSUME, ZCBOR_MAX_ELEM_COUNT)) {
 		ZCBOR_FAIL();
 	}
 
@@ -268,6 +294,7 @@ bool zcbor_bstr_start_encode(zcbor_state_t *state)
 
 	/* Encode a dummy header */
 	if (!value_encode(state, ZCBOR_MAJOR_TYPE_BSTR, &max_len, sizeof(max_len))) {
+		zcbor_process_backup(state, ZCBOR_FLAG_CONSUME, ZCBOR_MAX_ELEM_COUNT);
 		ZCBOR_FAIL();
 	}
 	return true;
@@ -288,14 +315,12 @@ bool zcbor_bstr_end_encode(zcbor_state_t *state, struct zcbor_string *result)
 		result = &dummy_value;
 	}
 
-	if (!zcbor_process_backup(state, ZCBOR_FLAG_RESTORE | ZCBOR_FLAG_CONSUME, ZCBOR_MAX_ELEM_COUNT)) {
-		ZCBOR_FAIL();
-	}
+	ZCBOR_FAIL_IF(!exit_backup(state));
 
 	result->value = state->payload + zcbor_header_len(zcbor_remaining_str_len(state));
 	result->len = (size_t)payload - (size_t)result->value;
 
-	/* Reencode header of list now that we know the number of elements. */
+	/* Reencode header of list now that we know the length. */
 	if (!zcbor_bstr_encode(state, result)) {
 		ZCBOR_FAIL();
 	}
@@ -313,12 +338,15 @@ static bool str_encode(zcbor_state_t *state,
 	if (input->len > (size_t)(state->payload_end - state->payload)) {
 		ZCBOR_ERR(ZCBOR_ERR_NO_PAYLOAD);
 	}
+	if (!input->value && (input->len > 0)) {
+		ZCBOR_ERR(ZCBOR_ERR_BAD_ARG);
+	}
 	if (!str_start_encode(state, input, major_type)) {
 		ZCBOR_FAIL();
 	}
-	if (state->payload_mut != input->value) {
+	if ((state->payload_mut != input->value) && (input->len > 0)) {
 		/* Use memmove since string might be encoded into the same space
-		 * because of bstrx_cbor_start_encode/bstrx_cbor_end_encode. */
+		 * because of zcbor_bstr_start_encode/zcbor_bstr_end_encode. */
 		memmove(state->payload_mut, input->value, input->len);
 	}
 	state->payload += input->len;
@@ -366,7 +394,119 @@ bool zcbor_tstr_put_term(zcbor_state_t *state, char const *str, size_t maxlen)
 }
 
 
-static bool list_map_start_encode(zcbor_state_t *state, size_t max_num,
+#ifdef ZCBOR_FRAGMENTS
+
+static bool start_encode_fragments(zcbor_state_t *state,
+	zcbor_major_type_t major_type, size_t len, bool cbor_bstr)
+{
+	ZCBOR_CHECK_PAYLOAD();
+
+
+	if (state->inside_cbor_bstr) {
+		size_t offset;
+
+		ZCBOR_FAIL_IF(!zcbor_current_string_offset(state, &offset));
+		if ((state->str_total_len_cbor - offset - zcbor_header_len(len)) < len) {
+			ZCBOR_ERR(ZCBOR_ERR_TOO_LARGE_FOR_STRING);
+		}
+	}
+
+	if (cbor_bstr) {
+		if (!zcbor_new_backup(state, 0)) {
+			ZCBOR_FAIL();
+		}
+	}
+
+	if (!value_encode(state, major_type, &len, sizeof(len))) {
+		if (cbor_bstr) {
+			zcbor_process_backup(state, ZCBOR_FLAG_CONSUME | ZCBOR_FLAG_RESTORE, ZCBOR_MAX_ELEM_COUNT);
+		}
+		ZCBOR_FAIL();
+	}
+
+	ptrdiff_t new_offset = state->constant_state->curr_payload_section - state->payload;
+
+	if (cbor_bstr) {
+		state->frag_offset_cbor = new_offset;
+		state->str_total_len_cbor = len;
+		state->inside_cbor_bstr = true;
+	} else {
+		state->frag_offset = new_offset;
+		state->str_total_len = len;
+		state->inside_frag_str = true;
+	}
+
+	return true;
+}
+
+
+bool zcbor_bstr_fragments_start_encode(zcbor_state_t *state, size_t len)
+{
+	return start_encode_fragments(state, ZCBOR_MAJOR_TYPE_BSTR, len, false);
+}
+
+
+bool zcbor_tstr_fragments_start_encode(zcbor_state_t *state, size_t len)
+{
+	return start_encode_fragments(state, ZCBOR_MAJOR_TYPE_TSTR, len, false);
+}
+
+
+bool zcbor_cbor_bstr_fragments_start_encode(zcbor_state_t *state, size_t len)
+{
+	return start_encode_fragments(state, ZCBOR_MAJOR_TYPE_BSTR, len, true);
+}
+
+
+bool zcbor_str_fragment_encode(zcbor_state_t *state, struct zcbor_string *fragment, size_t *enc_len)
+{
+	ZCBOR_CHECK_PAYLOAD();
+
+	size_t remainder;
+
+	ZCBOR_ERR_IF(!state->inside_frag_str, ZCBOR_ERR_NOT_IN_FRAGMENT);
+	ZCBOR_FAIL_IF(!zcbor_current_string_remainder(state, &remainder));
+	ZCBOR_ERR_IF(fragment->len > remainder, ZCBOR_ERR_TOO_LARGE_FOR_STRING);
+	ZCBOR_ERR_IF(!fragment->value && (fragment->len > 0), ZCBOR_ERR_BAD_ARG);
+
+	size_t len  = MIN((size_t)state->payload_end - (size_t)state->payload, fragment->len);
+
+	if (len > 0) {
+		memcpy(state->payload_mut, fragment->value, len);
+	}
+	state->payload += len;
+
+	if (enc_len != NULL) {
+		*enc_len = len;
+	}
+
+	return true;
+}
+
+
+bool zcbor_str_fragments_end_encode(zcbor_state_t *state)
+{
+	ZCBOR_ERR_IF(!state->inside_frag_str && !state->inside_cbor_bstr, ZCBOR_ERR_NOT_IN_FRAGMENT);
+	size_t remainder;
+	ZCBOR_FAIL_IF(!zcbor_current_string_remainder(state, &remainder));
+	ZCBOR_ERR_IF(remainder != 0, ZCBOR_ERR_NOT_AT_END);
+
+	if (state->inside_frag_str) {
+		state->inside_frag_str = false;
+	} else {
+		if (!zcbor_process_backup(state, ZCBOR_FLAG_RESTORE | ZCBOR_FLAG_CONSUME | ZCBOR_FLAG_KEEP_PAYLOAD, ZCBOR_MAX_ELEM_COUNT)) {
+			ZCBOR_FAIL();
+		}
+		state->elem_count++;
+	}
+
+	return true;
+}
+
+#endif /* ZCBOR_FRAGMENTS */
+
+
+static bool list_map_start_encode(zcbor_state_t *state, size_t size_hint,
 		zcbor_major_type_t major_type)
 {
 #ifdef ZCBOR_CANONICAL
@@ -375,12 +515,12 @@ static bool list_map_start_encode(zcbor_state_t *state, size_t max_num,
 	}
 
 	/* Encode dummy header with max number of elements. */
-	if (!value_encode(state, major_type, &max_num, sizeof(max_num))) {
+	if (!value_encode(state, major_type, &size_hint, sizeof(size_hint))) {
 		ZCBOR_FAIL();
 	}
 	state->elem_count--; /* Because of dummy header. */
 #else
-	(void)max_num;
+	(void)size_hint;
 
 	if (!encode_header_byte(state, major_type, ZCBOR_VALUE_IS_INDEFINITE_LENGTH)) {
 		ZCBOR_FAIL();
@@ -390,19 +530,19 @@ static bool list_map_start_encode(zcbor_state_t *state, size_t max_num,
 }
 
 
-bool zcbor_list_start_encode(zcbor_state_t *state, size_t max_num)
+bool zcbor_list_start_encode(zcbor_state_t *state, size_t size_hint)
 {
-	return list_map_start_encode(state, max_num, ZCBOR_MAJOR_TYPE_LIST);
+	return list_map_start_encode(state, size_hint, ZCBOR_MAJOR_TYPE_LIST);
 }
 
 
-bool zcbor_map_start_encode(zcbor_state_t *state, size_t max_num)
+bool zcbor_map_start_encode(zcbor_state_t *state, size_t size_hint)
 {
-	return list_map_start_encode(state, max_num, ZCBOR_MAJOR_TYPE_MAP);
+	return list_map_start_encode(state, size_hint, ZCBOR_MAJOR_TYPE_MAP);
 }
 
 
-static bool list_map_end_encode(zcbor_state_t *state, size_t max_num,
+static bool list_map_end_encode(zcbor_state_t *state, size_t size_hint,
 			zcbor_major_type_t major_type)
 {
 #ifdef ZCBOR_CANONICAL
@@ -411,45 +551,65 @@ static bool list_map_end_encode(zcbor_state_t *state, size_t max_num,
 	size_t list_count = ((major_type == ZCBOR_MAJOR_TYPE_LIST) ?
 					state->elem_count
 					: (state->elem_count / 2));
+	zcbor_log("list_count: %zu\r\n", list_count);
 
 	const uint8_t *payload = state->payload;
 
-	size_t max_header_len = zcbor_header_len_ptr(&max_num, 4) - 1;
-	size_t header_len = zcbor_header_len_ptr(&list_count, 4) - 1;
+	size_t hint_header_len = zcbor_header_len(size_hint);
+	size_t header_len = zcbor_header_len(list_count);
 
+	/** If size hint was correct, no need to process anything,
+	  * just delete the backup and count the complete list/map as an element.
+	  * This saves time, and also allows list/map to be encoded in fragments,
+	  * as long as the size_hint at the start is correct. */
+	if (size_hint == list_count) {
+		if (!zcbor_process_backup(state, ZCBOR_FLAG_RESTORE | ZCBOR_FLAG_CONSUME | ZCBOR_FLAG_KEEP_PAYLOAD, ZCBOR_MAX_ELEM_COUNT)) {
+			ZCBOR_FAIL();
+		}
+		state->elem_count++;
+		return true;
+	}
+
+	/** This resets the payload pointer to before the list/map header.
+	  * For that reason the previous payload was stored above to be used in
+	  * later calculations. */
 	if (!zcbor_process_backup(state, ZCBOR_FLAG_RESTORE | ZCBOR_FLAG_CONSUME, ZCBOR_MAX_ELEM_COUNT)) {
 		ZCBOR_FAIL();
 	}
 
-	zcbor_log("list_count: %zu\r\n", list_count);
+	const uint8_t *old_body_start = state->payload + hint_header_len;
+	uint8_t *new_body_start = state->payload_mut + header_len;
+	size_t body_size = (size_t)payload - (size_t)old_body_start;
 
-
-	/** If max_num is smaller than the actual number of encoded elements,
-	  * the value_encode() below will corrupt the data if the encoded
-	  * header is larger than the previously encoded header. */
-	if (header_len > max_header_len) {
-		zcbor_log("max_num too small.\r\n");
-		ZCBOR_ERR(ZCBOR_ERR_HIGH_ELEM_COUNT);
+	/* Overflow check */
+	if (payload < old_body_start) {
+		ZCBOR_ERR(ZCBOR_ERR_BAD_ARG);
 	}
 
-	/* Reencode header of list now that we know the number of elements. */
+	/** memmove before encoding the header since encoding the header will
+	  * corrupt the data if the new header is larger than the previous header.
+	  * For this case, we must also check that the memmove does not overflow
+	  * the payload buffer, since the data is memmoved to a higher memory
+	  * address. */
+	if (new_body_start != old_body_start) {
+		if ((new_body_start + body_size) > state->payload_end) {
+			ZCBOR_ERR(ZCBOR_ERR_NO_PAYLOAD);
+		}
+		memmove(new_body_start, old_body_start, body_size);
+	}
+
+	/* Reencode header of list with the actual number of elements. */
 	if (!(value_encode(state, major_type, &list_count, sizeof(list_count)))) {
 		ZCBOR_FAIL();
 	}
 
-	if (max_header_len != header_len) {
-		const uint8_t *start = state->payload + max_header_len - header_len;
-		size_t body_size = (size_t)payload - (size_t)start;
+	zcbor_assert_state(state->payload_mut == new_body_start,
+		"Payload at different address than expected from zcbor_header_len().\r\n");
 
-		memmove(state->payload_mut, start, body_size);
-		/* Reset payload pointer to end of list */
-		state->payload += body_size;
-	} else {
-		/* Reset payload pointer to end of list */
-		state->payload = payload;
-	}
+	/* Move payload pointer to end of list. */
+	state->payload += body_size;
 #else
-	(void)max_num;
+	(void)size_hint;
 	(void)major_type;
 	if (!encode_header_byte(state, ZCBOR_MAJOR_TYPE_SIMPLE, ZCBOR_VALUE_IS_INDEFINITE_LENGTH)) {
 		ZCBOR_FAIL();
@@ -459,27 +619,34 @@ static bool list_map_end_encode(zcbor_state_t *state, size_t max_num,
 }
 
 
-bool zcbor_list_end_encode(zcbor_state_t *state, size_t max_num)
+bool zcbor_list_end_encode(zcbor_state_t *state, size_t size_hint)
 {
-	return list_map_end_encode(state, max_num, ZCBOR_MAJOR_TYPE_LIST);
+	return list_map_end_encode(state, size_hint, ZCBOR_MAJOR_TYPE_LIST);
 }
 
 
-bool zcbor_map_end_encode(zcbor_state_t *state, size_t max_num)
+bool zcbor_map_end_encode(zcbor_state_t *state, size_t size_hint)
 {
-	return list_map_end_encode(state, max_num, ZCBOR_MAJOR_TYPE_MAP);
+	return list_map_end_encode(state, size_hint, ZCBOR_MAJOR_TYPE_MAP);
 }
 
 
 bool zcbor_list_map_end_force_encode(zcbor_state_t *state)
 {
+	ZCBOR_PRINT_FUNC_NAME();
 #ifdef ZCBOR_CANONICAL
-	if (!zcbor_process_backup(state, ZCBOR_FLAG_RESTORE | ZCBOR_FLAG_CONSUME, ZCBOR_MAX_ELEM_COUNT)) {
-		ZCBOR_FAIL();
-	}
-#endif
+	return exit_backup(state);
+#else
 	(void)state;
 	return true;
+#endif
+}
+
+
+bool zcbor_bstr_end_force_encode(zcbor_state_t *state)
+{
+	ZCBOR_PRINT_FUNC_NAME();
+	return exit_backup(state);
 }
 
 
@@ -565,6 +732,7 @@ bool zcbor_float32_put(zcbor_state_t *state, float input)
 
 bool zcbor_float16_encode(zcbor_state_t *state, const float *input)
 {
+	ZCBOR_ERR_IF(input == NULL, ZCBOR_ERR_BAD_ARG);
 	return zcbor_float16_put(state, *input);
 }
 
@@ -628,11 +796,18 @@ bool zcbor_multi_encode(const size_t num_encode, zcbor_encoder_t encoder,
 	ZCBOR_CHECK_NULL(state);
 	ZCBOR_CHECK_ERROR();
 
+	size_t backup_num = zcbor_get_backup_num(state);
+
 	for (size_t i = 0; i < num_encode; i++) {
-		if (!encoder(state, (const uint8_t *)input + i*result_len)) {
+		bool ret = encoder(state, (const uint8_t *)input + i*result_len);
+
+		ZCBOR_ERR_IF(zcbor_get_backup_num(state) != backup_num, ZCBOR_ERR_BACKUP_MISMATCH);
+
+		if (!ret) {
 			ZCBOR_FAIL();
 		}
 	}
+
 	zcbor_log("Encoded %zu elements.\n", num_encode);
 	return true;
 }

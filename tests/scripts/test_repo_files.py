@@ -20,10 +20,10 @@ from time import sleep
 from http import HTTPStatus
 from typing import List, Tuple, Optional
 
-
 p_script = Path(__file__).absolute()
 p_script_dir = p_script.parent
 p_root = p_script_dir.parents[1]
+p_zcbor_py = p_root / "zcbor" / "zcbor.py"
 p_tests = p_root / "tests"
 p_readme = p_root / "README.md"
 p_pypi_readme = p_root / "pypi_README.md"
@@ -42,7 +42,7 @@ p_pet_build = p_pet_sample / "build"
 
 
 DEFAULT_TARGET_REF = "main"
-DEFAULT_TARGET_REPO = "NordicSemiconductor/zcbor"
+DEFAULT_TARGET_REPO = "nordicsemi/zcbor"
 
 
 class GitRepoInfo:
@@ -154,6 +154,7 @@ class LinkTester:
     """Test the links in the documentation files."""
 
     known_good_urls = {
+        "https://github.com/nordicsemi/zcbor/issues",
         "https://github.com/NordicSemiconductor/zcbor/issues",
         "https://github.com/zephyrproject-rtos/zephyr",
         "https://en.wikipedia.org/wiki/CBOR",
@@ -170,6 +171,7 @@ class LinkTester:
         "https://datatracker.ietf.org/doc/rfc8610/",
         "https://github.com/zephyrproject-rtos/zephyr/blob/main/subsys/mgmt/mcumgr/grp/img_mgmt/src/img_mgmt.c",
         "https://github.com/nrfconnect/sdk-nrfxlib/blob/main/nrf_rpc/nrf_rpc_cbor.c",
+        "https://github.com/nordicsemi/zcbor",
         "https://github.com/NordicSemiconductor/zcbor",
         "https://pypi.org/project/cbor2/",
         "https://github.com/zephyrproject-rtos/zephyr/blob/v3.6.0/doc/releases/migration-guide-3.6.rst",
@@ -182,13 +184,15 @@ class LinkTester:
         "https://github.com/nrfconnect/sdk-nrf/blob/main/subsys/mgmt/fmfu/src/fmfu_mgmt.c",
     }
 
-    def __init__(self, *args, **kwargs):
+    urls_never_check = {
+        "https://en.wikipedia.org/wiki/CBOR",  # Returns 403 for runs on GitHub Actions
+    }
+
+    def __init__(self, *args, force_check_all=False, **kwargs):
         super(LinkTester, self).__init__()
         self.repo_info = GitRepoInfo()
         self.link_regex = compile(r"\[.*?\]\((?P<link>.*?)\)")
-        self.check_all = (
-            self.repo_info.current_branch == "main" or "release/" in self.repo_info.current_branch
-        )
+        self.check_all = ("release/" in self.repo_info.current_branch) or (force_check_all)
 
     @staticmethod
     def _get_relative_path(file_path: Path) -> str:
@@ -265,9 +269,28 @@ class LinkTester:
 
 class TestCodestyle(TestCase):
     def test_codestyle(self):
-        black_res = Popen(["black", "--check", p_root, "-l", "100"], stdout=PIPE, stderr=PIPE)
+        black_res = Popen(["black", "--check", p_root, "-l", "105"], stdout=PIPE, stderr=PIPE)
         _, stderr = black_res.communicate()
         self.assertEqual(0, black_res.returncode, "black failed:\n" + stderr.decode("utf-8"))
+
+
+class TestUnusedFunctions(TestCase):
+    def do_test_unused_functions(self, file_path: Path) -> None:
+        """Check for unused functions in a given file."""
+        contents = file_path.read_text(encoding="utf-8")
+        func_pattern = compile(r"def\s+(?P<func_name>\w+)\(")
+        funcs = func_pattern.findall(contents)
+        unused = [
+            func
+            for func in funcs
+            if (not func.startswith("__")) and len(compile(rf"\W{func}\W").findall(contents)) < 2
+        ]
+        if len(unused) > 0:
+            self.fail(f"Unused functions in {file_path}:\n" + "\n".join(unused))
+
+    def test_unused_functions(self):
+        for file_path in [p_zcbor_py]:
+            self.do_test_unused_functions(file_path)
 
 
 def version_int(in_str):
@@ -333,8 +356,7 @@ class TestSamples(TestCase):
                 self.assertEqual(f.readline().strip(" *#\n"), "SPDX-License-Identifier: Apache-2.0")
                 f.readline()  # discard
                 self.assertIn("Generated using zcbor version", f.readline())
-                self.assertIn("https://github.com/NordicSemiconductor/zcbor", f.readline())
-                self.assertIn("Generated with a --default-max-qty of", f.readline())
+                self.assertIn("https://github.com/nordicsemi/zcbor", f.readline())
 
 
 class TestDocs(TestCase, LinkTester):
@@ -354,9 +376,7 @@ class TestDocs(TestCase, LinkTester):
         TestCase.__init__(self, *args, **kwargs)
         LinkTester.__init__(self, *args, **kwargs)
 
-    def _validate_local_links(
-        self, local_links: List[str], processed_links, allow_local: bool
-    ) -> None:
+    def _validate_local_links(self, local_links: List[str], processed_links, allow_local: bool) -> None:
         """Validate that local file links exist."""
         all_locals = local_links + processed_links
         self.assertTrue(
@@ -372,9 +392,7 @@ class TestDocs(TestCase, LinkTester):
     def _check_results(self, results: List[Tuple]) -> None:
         """Check the results of URL checks."""
         for url, status_code, response in results:
-            self.assertEqual(
-                status_code, HTTPStatus.OK, f"'{url}' returned status code {status_code}"
-            )
+            self.assertEqual(status_code, HTTPStatus.OK, f"'{url}' returned status code {status_code}")
             if "#" in url and "https://docs.zephyrproject.org/latest/kconfig.html" not in url:
                 # https://docs.zephyrproject.org/latest/kconfig.html works in a different way
                 anchor = url.split("#", 1)[1]
@@ -444,7 +462,7 @@ class TestDocs(TestCase, LinkTester):
         unused_urls = self.known_good_urls - all_urls
         self.assertFalse(unused_urls, "Known good URLs not in the docs:\n" + "\n".join(unused_urls))
 
-        results = self.check_urls_async(self.known_good_urls)
+        results = self.check_urls_async(self.known_good_urls - self.urls_never_check)
         self._check_results(results)
 
     @skipIf(

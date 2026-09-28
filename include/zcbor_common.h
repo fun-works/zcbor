@@ -107,6 +107,24 @@ union {
 	bool payload_moved; /**< Is set to true while the state is stored as a backup
 	                         if @ref zcbor_update_state is called, since that function
 	                         updates the payload_end of all backed-up states. */
+	bool inside_cbor_bstr; /**< True if we are currently inside a CBOR-encoded bstr,
+	                            i.e. that as been started with zcbor_bstr_start_*(), or
+	                            `zcbor_cbor_bstr_fragments_start_*()`. */
+#ifdef ZCBOR_FRAGMENTS
+	bool inside_frag_str; /**< True if we are currently inside a fragmented (non-CBOR-encoded)
+	                           string. This is mutually exclusive with `inside_cbor_bstr`,
+	                           i.e. not set when using `zcbor_cbor_bstr_fragments_start_*()` */
+	ptrdiff_t frag_offset; /**< The offset in the current string at which this payload section starts.
+	                            Used for non-CBOR-encoded strings. Can be negative if the current string
+	                            started in this payload section. */
+	size_t str_total_len; /**< The total length of the string this fragment is a part of.
+	                           Used for non-CBOR-encoded strings. */
+	ptrdiff_t frag_offset_cbor; /**< The offset in the current string at which this payload section starts.
+	                                 Used for CBOR-encoded strings. Can be negative if the current string
+	                                 started in this payload section. */
+	size_t str_total_len_cbor; /**< The total length of the string this fragment is a part of.
+	                                Used for CBOR-encoded strings. */
+#endif
 
 /* This is the "decode state", the part of zcbor_state_t that is only used by zcbor_decode.c. */
 struct {
@@ -116,22 +134,45 @@ struct {
 	bool counting_map_elems; /**< Is set to true while the number of elements of the
 	                              current map are being counted. */
 #ifdef ZCBOR_MAP_SMART_SEARCH
-	uint8_t *map_search_elem_state; /**< Optional flags to use when searching unordered
-	                                     maps. If this is not NULL and map_elem_count
-	                                     is non-zero, this consists of one flag per element
-	                                     in the current map. The n-th bit can be set to 0
-	                                     to indicate that the n-th element in the
-	                                     map should not be searched. These are manipulated
-	                                     via zcbor_elem_processed() or
-	                                     zcbor_unordered_map_search(), and should not be
-	                                     manipulated directly. */
+	bool elem_state_backed_up; /**< Is set to true if the map elements have been backed up.
+	                                This flag is used internally by the backup process. */
+	uint8_t *map_search_elem_state; /**< This buffer is a single continuous array of bytes,
+	which are all used as 1 bit flags. If flag n is cleared, element n of the current unordered
+	map is skipped when searching the map with @ref zcbor_unordered_map_search.
+
+	These flags are manipulated via @ref zcbor_elem_processed, or (when manually_process_elem is
+	set) automatically by @ref zcbor_unordered_map_search, and should not be manipulated directly.
+	The current active buffer size is given by map_elem_count, and the end of the entire
+	allocated buffer is found at map_search_elem_state_end.
+
+	The following paragraphs describe internal processes, not actions that can be taken by the
+	end user. However, when creating the state variable, the provided elem_state buffer must be
+	large enough to	accomodate all this, nested unordered maps and rollback points within the
+	unordered maps.
+
+	If a nested unordered map is entered, @ref map_search_elem_state is advanced to accomodate
+	the new map while leaving the previous map's state intact. The previous map's state is
+	returned to when restoring the backup made at the start of the nested map.
+
+	The current flags can also be fully backed up if a rollback point is needed while processing
+	the map. The backup is created by advancing @ref map_search_elem_state, and copying the current
+	state to the new location. The new location becomes the active state, which allows it to
+	continue to grow.
+
+	If the backup is restored, @ref map_search_elem_state is moved back to the previous location.
+	If the backup is discarded, the active state is memmoved back to the previous location.
+
+	Such a rollback point is created automatically when starting a union with
+	@ref zcbor_union_start_code, and also when decoding with @ref zcbor_multi_decode_w_backup or
+	@ref zcbor_present_decode_w_backup. Restoring/discarding the backup is also handled
+	automatically in those cases. */
 #else
 	size_t map_elems_processed; /**< The number of elements of an unordered map
 	                                 that have been processed. */
 #endif
-	size_t map_start_backup_num; /** The index of the backup made at the start of the current map.
-	                                 This is used to move to the start of the map when searching
-					 unordered maps. */
+	size_t map_start_backup_num; /** The index of the backup made at the start of the current
+	                                 map. This is used to move to the start of the map when
+	                                 traversing unordered maps during zcbor_unordered_map_search. */
 	size_t map_elem_count; /**< Number of elements in the current unordered map.
 	                            This also serves as the number of bits (not bytes)
 	                            in the map_search_elem_state array (when applicable). */
@@ -155,6 +196,10 @@ struct zcbor_state_constant {
 #ifdef ZCBOR_MAP_SMART_SEARCH
 	uint8_t *map_search_elem_state_end; /**< The end of the @ref map_search_elem_state buffer. */
 #endif
+	const uint8_t *curr_payload_section; /**< The currently encoded/decoded payload section.
+	                                          I.e. the payload pointer this state was created with,
+	                                          or the payload pointer of the most recent call to
+	                                          zcbor_update_state. */
 };
 
 #ifdef ZCBOR_CANONICAL
@@ -297,6 +342,11 @@ do { \
 #define ZCBOR_ERR_CONSTANT_STATE_MISSING 22
 #define ZCBOR_ERR_BAD_ARG 23
 #define ZCBOR_ERR_NO_FLAG_MEM 24
+#define ZCBOR_ERR_BAD_STATE 25 ///! The zcbor_state_t struct is in a bad state.
+#define ZCBOR_ERR_TOO_LARGE_FOR_STRING 26 ///! Trying to start a nested string that is too large to fit in the container string.
+#define ZCBOR_ERR_NOT_IN_FRAGMENT 27 ///! The action requires being inside a fragmented string, but we are currently not inside one.
+#define ZCBOR_ERR_INSIDE_STRING 28 ///! Currently encoding/decoding a non-CBOR-encoded string, so cannot use most zcbor encoding/decoding functions
+#define ZCBOR_ERR_BACKUP_MISMATCH 29 ///! An encoding or decoding action unexpectedly changed the active backup count. The zcbor state is likely corrupted.
 #define ZCBOR_ERR_UNKNOWN 31
 
 /** The largest possible elem_count. */
@@ -305,9 +355,17 @@ do { \
 /** Initial value for elem_count for when it just needs to be large. */
 #define ZCBOR_LARGE_ELEM_COUNT (ZCBOR_MAX_ELEM_COUNT - 15)
 
+#define ZCBOR_EXTRA_STATES 2 ///! The number of extra states always needed (e.g. for the constant state), i.e. in addition to the optional ones for backups and flags.
 
-/** Take a backup of the current state. Overwrite the current elem_count. */
+
+/** Take a backup of the @p state. Then, overwrite the current elem_count in @p state.
+ *  Can optionally take a backup of the elem_state if @p backup_elem_state is true.
+ *  In @ref zcbor_new_backup, @p backup_elem_state is false.
+ *
+ *  If @ref ZCBOR_MAP_SMART_SEARCH is not defined, @p backup_elem_state is ignored (assumed false).
+ */
 bool zcbor_new_backup(zcbor_state_t *state, size_t new_elem_count);
+bool zcbor_new_backup_w_elem_state(zcbor_state_t *state, size_t new_elem_count, bool backup_elem_state);
 
 /** Consult a backup, and act on it based on the @p flags (See ZCBOR_FLAG_*).
  *
@@ -318,6 +376,17 @@ bool zcbor_new_backup(zcbor_state_t *state, size_t new_elem_count);
  *  @ref zcbor_process_backup acts on the most recent backup, i.e. the one at
  *  `state->constant_state->current_backup`.
  *  @ref zcbor_process_backup_num acts on the backup at @p backup_num.
+ *
+ *  @param state            The state to process the backup on.
+ *  @param flags            Flags to control the processing. See ZCBOR_FLAG_*.
+ *                          Restrictions:
+ *                          - ZCBOR_FLAG_CONSUME and ZCBOR_FLAG_KEEP_DECODE_STATE are
+ *                            mututally exclusive.
+ *                          - If ZCBOR_FLAG_CONSUME is set, backup_num (if applicable)
+ *                            must be equal to current_backup.
+ *  @param max_elem_count   Deprecated. Must be ZCBOR_MAX_ELEM_COUNT.
+ *  @param backup_num       The index of the backup to process. Must be between 1 and
+ *                          state->constant_state->current_backup (inclusive).
  */
 bool zcbor_process_backup(zcbor_state_t *state, uint32_t flags, size_t max_elem_count);
 bool zcbor_process_backup_num(zcbor_state_t *state, uint32_t flags,
@@ -433,17 +502,32 @@ static inline void zcbor_error(zcbor_state_t *state, int err)
 	}
 }
 
-/** Whether the current payload is exhausted. */
+/** Whether the current payload (section) is exhausted. */
 static inline bool zcbor_payload_at_end(const zcbor_state_t *state)
 {
 	return (state->payload == state->payload_end);
 }
 
-/** Update the current payload pointer (and payload_end).
+
+static inline size_t zcbor_get_backup_num(const zcbor_state_t *state)
+{
+	if (!state || !state->constant_state) {
+		return 0;
+	}
+	return state->constant_state->current_backup;
+}
+
+/** Introduce a new payload section.
  *
+ *  Updates the current payload pointer (and payload_end and frag_offset(_cbor)).
  *  For use when the payload is divided into multiple chunks.
  *
- *  This function also updates all backups to the new payload_end.
+ *  This function also updates all backups to the new payload_end,
+ *  and also updates the frag_offset/frag_offset_cbor of all backups.
+ *
+ *  Note that if this is called before the current payload is exhausted, the
+ *  remaining payload will be abandoned.
+ *
  *  This sets a flag so that @ref zcbor_process_backup fails if a backup is
  *  processed with the flag @ref ZCBOR_FLAG_RESTORE, but without the flag
  *  @ref ZCBOR_FLAG_KEEP_PAYLOAD since this would cause an invalid state.
@@ -455,6 +539,17 @@ static inline bool zcbor_payload_at_end(const zcbor_state_t *state)
  */
 void zcbor_update_state(zcbor_state_t *state,
 		const uint8_t *payload, size_t payload_len);
+
+/** Get the the offset into the current string to which the current payload
+ *  pointer (state->payload) points. */
+bool zcbor_current_string_offset(zcbor_state_t *state, size_t *offset);
+
+/** Get the remaining number of bytes in the current string, calculated from
+ *  the current payload pointer (state->payload). */
+bool zcbor_current_string_remainder(zcbor_state_t *state, size_t *remainder);
+
+/** Can be used on any fragment to tell if it is the final fragment of its string. */
+bool zcbor_is_last_fragment(const struct zcbor_string_fragment *fragment);
 
 /** Check that the provided fragments are complete and in the right order.
  *
@@ -486,7 +581,8 @@ bool zcbor_validate_string_fragments(struct zcbor_string_fragment *fragments,
  *                                Out: The length of the assembled string.
  *
  *  @retval  true   On success.
- *  @retval  false  If the assembled string would be larger than the buffer.
+ *  @retval  false  If the assembled string would be larger than the buffer, or
+ *                  if a fragment with non-zero length has a NULL value.
  *                  The buffer might still be written to.
  */
 bool zcbor_splice_string_fragments(struct zcbor_string_fragment *fragments,
@@ -515,7 +611,11 @@ bool zcbor_compare_strings(const struct zcbor_string *str1,
  */
 size_t zcbor_header_len(uint64_t value);
 
-/** Like @ref zcbor_header_len but for integer of any size <= 8. */
+/** Like @ref zcbor_header_len but for integer of any size <= 8.
+ *
+ *  @return  The length of the header in bytes (1-9), or 0 if @p value is NULL
+ *           or @p value_len is above 8.
+ */
 size_t zcbor_header_len_ptr(const void *const value, size_t value_len);
 
 /** If a string (header + payload) is encoded into the rest of the payload, how long would it be?
@@ -546,8 +646,10 @@ float zcbor_float16_to_32(uint16_t input);
  */
 uint16_t zcbor_float32_to_16(float input);
 
-#ifdef ZCBOR_MAP_SMART_SEARCH
+/** Round up x to the nearest multiple of align. */
 #define ZCBOR_ROUND_UP(x, align) (((x) + (align) - 1) / (align) * (align))
+
+#ifdef ZCBOR_MAP_SMART_SEARCH
 #define ZCBOR_BITS_PER_BYTE 8
 
 /** Calculate the number of bytes needed to hold @p num_flags 1 bit flags

@@ -5,6 +5,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from unittest import TestCase, main
+from unittest.mock import patch
 from subprocess import Popen, PIPE
 from regex import sub, search, escape, compile
 from pathlib import Path
@@ -17,17 +18,14 @@ from tempfile import mkdtemp, NamedTemporaryFile
 from shutil import rmtree
 from os import linesep
 
-
 try:
     import zcbor
 except ImportError:
-    print(
-        """
+    print("""
 The zcbor package must be installed to run these tests.
 During development, install with `pip3 install -e .` to install in a way
 that picks up changes in the files without having to reinstall.
-"""
-    )
+""")
     exit(1)
 
 
@@ -46,6 +44,7 @@ p_test_vectors16 = tuple(
 p_test_vectors20 = tuple(Path(p_cases, f"manifest20_example{i}.cborhex") for i in range(6))
 p_optional = Path(p_cases, "optional.cddl")
 p_corner_cases = Path(p_cases, "corner_cases.cddl")
+p_unordered_map = Path(p_cases, "unordered_map.cddl")
 p_cose = Path(p_cases, "cose.cddl")
 p_manifest14_priv = Path(p_cases, "manifest14.priv")
 p_manifest14_pub = Path(p_cases, "manifest14.pub")
@@ -53,6 +52,8 @@ p_map_bstr_cddl = Path(p_cases, "map_bstr.cddl")
 p_map_bstr_yaml = Path(p_cases, "map_bstr.yaml")
 p_yaml_compat_cddl = Path(p_cases, "yaml_compatibility.cddl")
 p_yaml_compat_yaml = Path(p_cases, "yaml_compatibility.yaml")
+p_yaml_float_compat_cddl = Path(p_cases, "yaml_float_compatibility.cddl")
+p_yaml_float_compat_yaml = Path(p_cases, "yaml_float_compatibility.yaml")
 p_pet_cddl = Path(p_cases, "pet.cddl")
 p_README = Path(p_root, "README.md")
 p_prelude = Path(p_root, "zcbor", "prelude.cddl")
@@ -68,9 +69,7 @@ class TestManifest(TestCase):
 
     def decode_string(self, data_string, *cddl_paths):
         cddl_str = " ".join((Path(p).read_text(encoding="utf-8") for p in cddl_paths))
-        self.my_types = zcbor.DataTranslator.from_cddl(
-            cddl_string=cddl_str, default_max_qty=16
-        ).my_types
+        self.my_types = zcbor.DataTranslator.from_cddl(cddl_string=cddl_str, default_max_qty=16).my_types
         cddl = self.my_types["SUIT_Envelope_Tagged"]
         self.decoded = cddl.decode_str(data_string)
 
@@ -147,9 +146,7 @@ class TestEx1Manifest12(TestManifest):
         self.decode_file(p_test_vectors12[1], p_manifest12)
 
     def test_components(self):
-        self.assertEqual(
-            [b"\x00"], self.decoded.suit_manifest.suit_common.suit_components[0][0].bstr
-        )
+        self.assertEqual([b"\x00"], self.decoded.suit_manifest.suit_common.suit_components[0][0].bstr)
 
     def test_uri(self):
         self.assertEqual(
@@ -282,6 +279,26 @@ def loads(string):
     return cbor2.loads(string)
 
 
+def make_mutable(obj):
+    """Convert cbor2 6.x immutable types to mutable equivalents.
+
+    cbor2 6.x returns frozendict and tuple for maps and arrays inside tagged
+    structures. This wrapper converts them back to dict and list so the decoded
+    objects can be mutated (needed by tests that modify and re-encode CBOR).
+    """
+    if isinstance(obj, cbor2.CBORTag):
+        return cbor2.CBORTag(obj.tag, make_mutable(obj.value))
+    elif isinstance(obj, (dict, zcbor.zfrozendict)):
+        return {k: make_mutable(v) for k, v in obj.items()}
+    elif isinstance(obj, (list, tuple)):
+        return [make_mutable(v) for v in obj]
+    return obj
+
+
+def mutable_loads(string):
+    return make_mutable(loads(string))
+
+
 class TestEx0Manifest14(TestManifest):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -299,11 +316,9 @@ class TestEx0Manifest14(TestManifest):
             .int,
         )
 
-        manifest_signature = (
-            self.decoded.suit_authentication_wrapper.SUIT_Authentication_Block_bstr[
-                0
-            ].COSE_Sign1_Tagged_m.signature
-        )
+        manifest_signature = self.decoded.suit_authentication_wrapper.SUIT_Authentication_Block_bstr[
+            0
+        ].COSE_Sign1_Tagged_m.signature
         signature_header = self.decoded.suit_authentication_wrapper.SUIT_Authentication_Block_bstr[
             0
         ].COSE_Sign1_Tagged_m.Headers_m.protected.header_map_bstr_bstr
@@ -420,9 +435,7 @@ class TestEx1Manifest14(TestManifest):
         self.assertEqual(
             3,
             len(
-                self.decoded.suit_manifest.suit_common.suit_common_sequence[
-                    0
-                ].suit_common_sequence.union
+                self.decoded.suit_manifest.suit_common.suit_common_sequence[0].suit_common_sequence.union
             ),
         )
         self.assertEqual(
@@ -468,7 +481,7 @@ class TestEx1Manifest14(TestManifest):
 
     def test_cbor_pen(self):
         data = bytes.fromhex(p_test_vectors14[1].read_text(encoding="utf-8").replace("\n", ""))
-        struct = loads(data)
+        struct = mutable_loads(data)
         struct2 = loads(struct.value[3])  # manifest
         struct3 = loads(struct2[3])  # common sequence
         struct4 = loads(struct3[4])  # override params
@@ -485,10 +498,9 @@ class TestEx1Manifest14(TestManifest):
 class TestEx1InvManifest14(TestManifest):
     def test_inv0(self):
         data = bytes.fromhex(p_test_vectors14[1].read_text(encoding="utf-8").replace("\n", ""))
-        struct = loads(data)
+        struct = mutable_loads(data)
         struct2 = loads(struct.value[2])  # authentication
-        struct3 = loads(struct2[1])
-        struct3.tag = 99999  # invalid tag for COSE_Sign1
+        struct3 = cbor2.CBORTag(99999, loads(struct2[1]).value)  # invalid tag for COSE_Sign1
         struct2[1] = dumps(struct3)
         struct.value[2] = dumps(struct2)
         data = dumps(struct)
@@ -501,7 +513,7 @@ class TestEx1InvManifest14(TestManifest):
 
     def test_inv1(self):
         data = bytes.fromhex(p_test_vectors14[1].read_text(encoding="utf-8").replace("\n", ""))
-        struct = loads(data)
+        struct = mutable_loads(data)
         struct2 = loads(struct.value[3])  # manifest
         struct2[1] += 1  # invalid manifest version
         struct.value[3] = dumps(struct2)
@@ -515,19 +527,21 @@ class TestEx1InvManifest14(TestManifest):
 
     def test_inv2(self):
         data = bytes.fromhex(p_test_vectors14[1].read_text(encoding="utf-8").replace("\n", ""))
-        struct = loads(data)
+        struct = mutable_loads(data)
         struct.value[23] = b""  # Invalid integrated payload key
         data = dumps(struct)
         try:
             self.decode_string(data, p_manifest14, p_cose)
         except (zcbor.CddlValidationError, cbor2.CBORDecodeEOF) as e:
             return
+        except:
+            raise
         else:
             assert False, "Should have failed validation"
 
     def test_inv3(self):
         data = bytes.fromhex(p_test_vectors14[1].read_text(encoding="utf-8").replace("\n", ""))
-        struct = loads(data)
+        struct = mutable_loads(data)
         struct2 = loads(struct.value[3])  # manifest
         struct3 = loads(struct2[3])  # common sequence
         struct4 = loads(struct3[4])  # override params
@@ -645,15 +659,9 @@ class TestEx4Manifest14(TestManifest):
 
     def test_components(self):
         self.assertEqual(3, len(self.decoded.suit_manifest.suit_common.suit_components[0]))
-        self.assertEqual(
-            b"\x00", self.decoded.suit_manifest.suit_common.suit_components[0][0].bstr[0]
-        )
-        self.assertEqual(
-            b"\x02", self.decoded.suit_manifest.suit_common.suit_components[0][1].bstr[0]
-        )
-        self.assertEqual(
-            b"\x01", self.decoded.suit_manifest.suit_common.suit_components[0][2].bstr[0]
-        )
+        self.assertEqual(b"\x00", self.decoded.suit_manifest.suit_common.suit_components[0][0].bstr[0])
+        self.assertEqual(b"\x02", self.decoded.suit_manifest.suit_common.suit_components[0][1].bstr[0])
+        self.assertEqual(b"\x01", self.decoded.suit_manifest.suit_common.suit_components[0][2].bstr[0])
 
 
 class TestEx5Manifest14(TestManifest):
@@ -665,9 +673,7 @@ class TestEx5Manifest14(TestManifest):
         self.assertEqual(
             4,
             len(
-                self.decoded.suit_manifest.SUIT_Unseverable_Members.suit_validate[
-                    0
-                ].suit_validate.union
+                self.decoded.suit_manifest.SUIT_Unseverable_Members.suit_validate[0].suit_validate.union
             ),
         )
         self.assertEqual(
@@ -681,7 +687,7 @@ class TestEx5Manifest14(TestManifest):
 class TestEx5InvManifest14(TestManifest):
     def test_invalid_rep_policy(self):
         data = bytes.fromhex(p_test_vectors14[5].read_text(encoding="utf-8").replace("\n", ""))
-        struct = loads(data)
+        struct = mutable_loads(data)
         struct2 = loads(struct.value[3])  # manifest
         struct3 = loads(struct2[10])  # suit_validate
         struct3[3] += 16  # invalid Rep_Policy
@@ -833,9 +839,7 @@ class TestEx1Manifest20(TestEx1Manifest16):
         self.assertEqual(
             3,
             len(
-                self.decoded.suit_manifest.suit_common.suit_shared_sequence[
-                    0
-                ].suit_shared_sequence.union
+                self.decoded.suit_manifest.suit_common.suit_shared_sequence[0].suit_shared_sequence.union
             ),
         )
         self.assertEqual(
@@ -980,15 +984,13 @@ class TestCLI1(CLI_Test):
 
         self.popen_test(self.get_std_args("-", cmd="validate") + ["--input-as", "cbor"], stdout3)
         stdout4, _ = self.popen_test(
-            self.get_std_args("-")
-            + ["--input-as", "cbor", "--output", "-", "--output-as", "cborhex"],
+            self.get_std_args("-") + ["--input-as", "cbor", "--output", "-", "--output-as", "cborhex"],
             stdout3,
         )
 
         self.popen_test(self.get_std_args("-", cmd="validate") + ["--input-as", "cborhex"], stdout4)
         stdout5, _ = self.popen_test(
-            self.get_std_args("-")
-            + ["--input-as", "cborhex", "--output", "-", "--output-as", "json"],
+            self.get_std_args("-") + ["--input-as", "cborhex", "--output", "-", "--output-as", "json"],
             stdout4,
         )
 
@@ -1104,8 +1106,7 @@ file header"""
 # file header
 #
 # Generated using zcbor version {p_VERSION.read_text(encoding="utf-8")}
-# https://github.com/NordicSemiconductor/zcbor
-# Generated with a --default-max-qty of 5
+# https://github.com/nordicsemi/zcbor
 #""".splitlines()
         exp_c_header = f"""/*
  * Sample
@@ -1113,12 +1114,11 @@ file header"""
  * file header
  *
  * Generated using zcbor version {p_VERSION.read_text(encoding="utf-8")}
- * https://github.com/NordicSemiconductor/zcbor
- * Generated with a --default-max-qty of 5
+ * https://github.com/nordicsemi/zcbor
  */""".splitlines()
         self.assertEqual(
             exp_cmake_header,
-            (self.tempd / "pet.cmake").read_text(encoding="utf-8").splitlines()[:9],
+            (self.tempd / "pet.cmake").read_text(encoding="utf-8").splitlines()[:8],
         )
         for p in (
             self.tempd / "src" / "pet_decode.c",
@@ -1127,7 +1127,7 @@ file header"""
             self.tempd / "include" / "pet_encode.h",
             self.tempd / "include" / "pet_types.h",
         ):
-            self.assertEqual(exp_c_header, p.read_text(encoding="utf-8").splitlines()[:9])
+            self.assertEqual(exp_c_header, p.read_text(encoding="utf-8").splitlines()[:8])
 
     def test_file_header(self):
         self.do_test_file_header()
@@ -1151,12 +1151,16 @@ class TestOptional(TestCase):
 class CornerCaseTest(TestCase):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.cddl_res = zcbor.DataTranslator.from_cddl(
-            cddl_string=p_prelude.read_text(encoding="utf-8")
-            + "\n"
-            + p_corner_cases.read_text(encoding="utf-8"),
-            default_max_qty=16,
-        )
+        try:
+            self.cddl_res = zcbor.DataTranslator.from_cddl(
+                cddl_string=p_prelude.read_text(encoding="utf-8")
+                + "\n"
+                + p_corner_cases.read_text(encoding="utf-8"),
+                default_max_qty=16,
+            )
+        except zcbor.CddlParsingError as e:
+            print(zcbor.format_parsing_error(e))
+            raise
 
 
 class TestUndefined(CornerCaseTest):
@@ -1249,9 +1253,123 @@ class TestYamlCompatibility(PopenTest):
             ],
             stdout1,
         )
-        self.assertEqual(
-            safe_load(stdout2), safe_load(p_yaml_compat_yaml.read_text(encoding="utf-8"))
+        self.assertEqual(safe_load(stdout2), safe_load(p_yaml_compat_yaml.read_text(encoding="utf-8")))
+
+
+class TestYamlFloatCompatibility(PopenTest):
+    def test_yaml_float_compatibility(self):
+        # Validate without --yaml-compatibility must fail.
+        self.popen_test(
+            [
+                "zcbor",
+                "validate",
+                "-c",
+                p_yaml_float_compat_cddl,
+                "-i",
+                p_yaml_float_compat_yaml,
+                "-t",
+                "float_types_t",
+            ],
+            exp_retcode=1,
         )
+        # Validate with --yaml-compatibility must succeed.
+        self.popen_test(
+            [
+                "zcbor",
+                "validate",
+                "-c",
+                p_yaml_float_compat_cddl,
+                "-i",
+                p_yaml_float_compat_yaml,
+                "-t",
+                "float_types_t",
+                "--yaml-compatibility",
+            ]
+        )
+        # Convert YAML->CBOR->YAML roundtrip.
+        stdout1, _ = self.popen_test(
+            [
+                "zcbor",
+                "convert",
+                "-c",
+                p_yaml_float_compat_cddl,
+                "-i",
+                p_yaml_float_compat_yaml,
+                "-o",
+                "-",
+                "-t",
+                "float_types_t",
+                "--yaml-compatibility",
+            ]
+        )
+        stdout2, _ = self.popen_test(
+            [
+                "zcbor",
+                "convert",
+                "-c",
+                p_yaml_float_compat_cddl,
+                "-i",
+                "-",
+                "-o",
+                "-",
+                "--output-as",
+                "yaml",
+                "-t",
+                "float_types_t",
+                "--yaml-compatibility",
+            ],
+            stdout1,
+        )
+        # cbor2.loads() converts each float value in CBOR to a Python float value, which is a double-precision float.
+        # The precision specified in the CDDL and contained in the CBOR hex string
+        # as float16 (0xf9), float32 (0xfa), or float64 (0xfb) is not preserved during conversion.
+        result = safe_load(stdout2)
+        original = safe_load(p_yaml_float_compat_yaml.read_text(encoding="utf-8"))
+        # Extract the float values from the original YAML for comparison.
+        expected_values = []
+        for d in original:
+            if isinstance(d, dict):
+                value = next(iter(d.values()))  # {zcbor_float16: 1.0} -> 1.0
+            else:
+                value = d  # plain floats
+            expected_values.append(value)
+        # check if the number of floats is the same
+        self.assertEqual(len(expected_values), len(result))
+        # check if the float values are approximately equal (considering precision loss)
+        for expected_val, result_val in zip(expected_values, result):
+            self.assertAlmostEqual(expected_val, result_val, places=2)
+
+
+class TestFloatYamlCompat(TestCase):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        try:
+            self.cddl_res = zcbor.DataTranslator.from_cddl(
+                cddl_string=p_prelude.read_text(encoding="utf-8")
+                + "\n"
+                + p_yaml_float_compat_cddl.read_text(encoding="utf-8"),
+                default_max_qty=16,
+            )
+        except zcbor.CddlParsingError as e:
+            print(zcbor.format_parsing_error(e))
+            raise
+
+    # CBOR bytes must contain correct precision markers (0xf9, 0xfa, 0xfb).
+    def test_float_conversion(self):
+        cddl = self.cddl_res.my_types["float_types_t"]
+        test_yaml = (
+            "[{zcbor_float16: 1.0}, {zcbor_float32: 1.0}, {zcbor_float64: 1.0}, {zcbor_float32: 1.0}]"
+        )
+
+        cbor_bytes = cddl.from_yaml(test_yaml, yaml_compat=True)
+        # float16 marker
+        self.assertIn(b"\xf9", cbor_bytes)
+        # float32 marker
+        self.assertIn(b"\xfa", cbor_bytes)
+        # float64 marker
+        self.assertIn(b"\xfb", cbor_bytes)
+        # undefined float in cddl, should be encoded as float32 ad defined in YAML
+        self.assertIn(b"\xfa", cbor_bytes)
 
 
 class TestIntmax(CornerCaseTest):
@@ -1296,7 +1414,7 @@ class TestInvalidIdentifiers(CornerCaseTest):
 
 
 class TestIntSize(PopenTest, TempdTest):
-    def do_test_int_size(self, mode, bit_size):
+    def do_test_int_size(self, mode, defines_arg, bit_size):
         self.popen_test(
             [
                 "zcbor",
@@ -1316,6 +1434,7 @@ class TestIntSize(PopenTest, TempdTest):
                 "--output-cmake",
                 self.tempd / "intmax.cmake",
             ]
+            + defines_arg
         )
 
         expected_output_types = [
@@ -1337,22 +1456,58 @@ class TestIntSize(PopenTest, TempdTest):
             f"uint{bit_size}_t DefaultInt_uint",
         ]
 
+        expected_defines = {
+            "INTMAX1_INT_8_MIN_VAL": "INT8_MIN",
+            "INTMAX1_INT_8_MAX_VAL": "INT8_MAX",
+            "INTMAX1_UINT_8_MAX_VAL": "UINT8_MAX",
+            "INTMAX1_INT_16_MIN_VAL": "INT16_MIN",
+            "INTMAX1_INT_16_MAX_VAL": "INT16_MAX",
+            "INTMAX1_UINT_16_MAX_VAL": "UINT16_MAX",
+            "INTMAX1_INT_32_MIN_VAL": "INT32_MIN",
+            "INTMAX1_INT_32_MAX_VAL": "INT32_MAX",
+            "INTMAX1_UINT_32_MAX_VAL": "UINT32_MAX",
+            "INTMAX1_INT_64_MIN_VAL": "INT64_MIN",
+            "INTMAX1_INT_64_MAX_VAL": "INT64_MAX",
+            "INTMAX1_UINT_64_MAX_VAL": "UINT64_MAX",
+            "INTMAX4_INT_8_MIN_VAL": "INT8_MIN",
+            "INTMAX4_INT_8_MAX_VAL": "INT8_MAX",
+            "INTMAX4_UINT_8_MAX_VAL": "UINT8_MAX",
+            "INTMAX4_INT_16_MIN_VAL": "INT16_MIN",
+            "INTMAX4_INT_16_MAX_VAL": "INT16_MAX",
+            "INTMAX4_UINT_16_MAX_VAL": "UINT16_MAX",
+            "INTMAX4_INT_32_MIN_VAL": "INT32_MIN",
+            "INTMAX4_INT_32_MAX_VAL": "INT32_MAX",
+            "INTMAX4_UINT_32_MAX_VAL": "UINT32_MAX",
+            "INTMAX4_INT_64_MIN_VAL": "INT64_MIN",
+            "INTMAX4_INT_64_MAX_VAL": "INT64_MAX",
+            "INTMAX4_UINT_64_MAX_VAL": "UINT64_MAX",
+            "INTMAX5_INT_8_MIN_PLUS1_VAL": "-129",
+            "INTMAX5_INT_8_MAX_PLUS1_VAL": "128",
+            "INTMAX5_UINT_8_MAX_PLUS1_VAL": "256",
+            "INTMAX5_INT_16_MIN_PLUS1_VAL": "-32769",
+            "INTMAX5_INT_16_MAX_PLUS1_VAL": "32768",
+            "INTMAX5_UINT_16_MAX_PLUS1_VAL": "65536",
+            "INTMAX5_INT_32_MIN_PLUS1_VAL": "-2147483649LL",
+            "INTMAX5_INT_32_MAX_PLUS1_VAL": "2147483648",
+            "INTMAX5_UINT_32_MAX_PLUS1_VAL": "4294967296ULL",
+        }
+
         lit_func = "put" if mode == "encode" else "expect"
         lit_p_func = "encode" if mode == "encode" else "pexpect"
         result_var = "input" if mode == "encode" else "result"
         expected_output_code = [
-            f"zcbor_int8_{lit_func}(state, (INT8_MIN))",
-            f"zcbor_uint8_{lit_func}(state, (INT8_MAX))",
-            f"zcbor_uint8_{lit_func}(state, (UINT8_MAX))",
-            f"zcbor_int16_{lit_func}(state, (INT16_MIN))",
-            f"zcbor_uint16_{lit_func}(state, (INT16_MAX))",
-            f"zcbor_uint16_{lit_func}(state, (UINT16_MAX))",
-            f"zcbor_int32_{lit_func}(state, (INT32_MIN))",
-            f"zcbor_uint32_{lit_func}(state, (INT32_MAX))",
-            f"zcbor_uint32_{lit_func}(state, (UINT32_MAX))",
-            f"zcbor_int64_{lit_func}(state, (INT64_MIN))",
-            f"zcbor_uint64_{lit_func}(state, (INT64_MAX))",
-            f"zcbor_uint64_{lit_func}(state, (UINT64_MAX))",
+            f"zcbor_int8_{lit_func}(state, (INTMAX1_INT_8_MIN_VAL)",
+            f"zcbor_uint8_{lit_func}(state, (INTMAX1_INT_8_MAX_VAL)",
+            f"zcbor_uint8_{lit_func}(state, (INTMAX1_UINT_8_MAX_VAL)",
+            f"zcbor_int16_{lit_func}(state, (INTMAX1_INT_16_MIN_VAL)",
+            f"zcbor_uint16_{lit_func}(state, (INTMAX1_INT_16_MAX_VAL)",
+            f"zcbor_uint16_{lit_func}(state, (INTMAX1_UINT_16_MAX_VAL)",
+            f"zcbor_int32_{lit_func}(state, (INTMAX1_INT_32_MIN_VAL)",
+            f"zcbor_uint32_{lit_func}(state, (INTMAX1_INT_32_MAX_VAL)",
+            f"zcbor_uint32_{lit_func}(state, (INTMAX1_UINT_32_MAX_VAL)",
+            f"zcbor_int64_{lit_func}(state, (INTMAX1_INT_64_MIN_VAL)",
+            f"zcbor_uint64_{lit_func}(state, (INTMAX1_INT_64_MAX_VAL)",
+            f"zcbor_uint64_{lit_func}(state, (INTMAX1_UINT_64_MAX_VAL)",
             f"zcbor_int8_{mode}(state, (&(*{result_var}).Intmax2_INT_8)",
             f"zcbor_uint8_{mode}(state, (&(*{result_var}).Intmax2_UINT_8)",
             f"zcbor_int16_{mode}(state, (&(*{result_var}).Intmax2_INT_16)",
@@ -1361,27 +1516,27 @@ class TestIntSize(PopenTest, TempdTest):
             f"zcbor_uint32_{mode}(state, (&(*{result_var}).Intmax2_UINT_32)",
             f"zcbor_int64_{mode}(state, (&(*{result_var}).Intmax2_INT_64)",
             f"zcbor_uint64_{mode}(state, (&(*{result_var}).Intmax2_UINT_64)",
-            f"&(*{result_var}).Intmax4_INT_8_MIN_count, ZCBOR_CUSTOM_CAST_FP(zcbor_int8_{lit_p_func}), state, (&(int8_t){{INT8_MIN}})",
-            f"&(*{result_var}).Intmax4_INT_8_MAX_count, ZCBOR_CUSTOM_CAST_FP(zcbor_uint8_{lit_p_func}), state, (&(uint8_t){{INT8_MAX}})",
-            f"&(*{result_var}).Intmax4_UINT_8_MAX_count, ZCBOR_CUSTOM_CAST_FP(zcbor_uint8_{lit_p_func}), state, (&(uint8_t){{UINT8_MAX}})",
-            f"&(*{result_var}).Intmax4_INT_16_MIN_count, ZCBOR_CUSTOM_CAST_FP(zcbor_int16_{lit_p_func}), state, (&(int16_t){{INT16_MIN}})",
-            f"&(*{result_var}).Intmax4_INT_16_MAX_count, ZCBOR_CUSTOM_CAST_FP(zcbor_uint16_{lit_p_func}), state, (&(uint16_t){{INT16_MAX}})",
-            f"&(*{result_var}).Intmax4_UINT_16_MAX_count, ZCBOR_CUSTOM_CAST_FP(zcbor_uint16_{lit_p_func}), state, (&(uint16_t){{UINT16_MAX}})",
-            f"&(*{result_var}).Intmax4_INT_32_MIN_count, ZCBOR_CUSTOM_CAST_FP(zcbor_int32_{lit_p_func}), state, (&(int32_t){{INT32_MIN}})",
-            f"&(*{result_var}).Intmax4_INT_32_MAX_count, ZCBOR_CUSTOM_CAST_FP(zcbor_uint32_{lit_p_func}), state, (&(uint32_t){{INT32_MAX}})",
-            f"&(*{result_var}).Intmax4_UINT_32_MAX_count, ZCBOR_CUSTOM_CAST_FP(zcbor_uint32_{lit_p_func}), state, (&(uint32_t){{UINT32_MAX}})",
-            f"&(*{result_var}).Intmax4_INT_64_MIN_count, ZCBOR_CUSTOM_CAST_FP(zcbor_int64_{lit_p_func}), state, (&(int64_t){{INT64_MIN}})",
-            f"&(*{result_var}).Intmax4_INT_64_MAX_count, ZCBOR_CUSTOM_CAST_FP(zcbor_uint64_{lit_p_func}), state, (&(uint64_t){{INT64_MAX}})",
-            f"&(*{result_var}).Intmax4_UINT_64_MAX_count, ZCBOR_CUSTOM_CAST_FP(zcbor_uint64_{lit_p_func}), state, (&(uint64_t){{UINT64_MAX}}),",
-            f"zcbor_int16_{lit_func}(state, (-129))",
-            f"zcbor_uint8_{lit_func}(state, (128))",
-            f"zcbor_uint16_{lit_func}(state, (256))",
-            f"zcbor_int32_{lit_func}(state, (-32769))",
-            f"zcbor_uint16_{lit_func}(state, (32768))",
-            f"zcbor_uint32_{lit_func}(state, (65536))",
-            f"zcbor_int64_{lit_func}(state, (-2147483649))",
-            f"zcbor_uint32_{lit_func}(state, (2147483648))",
-            f"zcbor_uint64_{lit_func}(state, (4294967296))",
+            f"&(*{result_var}).Intmax4_INT_8_MIN_count, ZCBOR_CUSTOM_CAST_FP(zcbor_int8_{lit_p_func}), state, (&(int8_t){{INTMAX4_INT_8_MIN_VAL}})",
+            f"&(*{result_var}).Intmax4_INT_8_MAX_count, ZCBOR_CUSTOM_CAST_FP(zcbor_uint8_{lit_p_func}), state, (&(uint8_t){{INTMAX4_INT_8_MAX_VAL}})",
+            f"&(*{result_var}).Intmax4_UINT_8_MAX_count, ZCBOR_CUSTOM_CAST_FP(zcbor_uint8_{lit_p_func}), state, (&(uint8_t){{INTMAX4_UINT_8_MAX_VAL}})",
+            f"&(*{result_var}).Intmax4_INT_16_MIN_count, ZCBOR_CUSTOM_CAST_FP(zcbor_int16_{lit_p_func}), state, (&(int16_t){{INTMAX4_INT_16_MIN_VAL}})",
+            f"&(*{result_var}).Intmax4_INT_16_MAX_count, ZCBOR_CUSTOM_CAST_FP(zcbor_uint16_{lit_p_func}), state, (&(uint16_t){{INTMAX4_INT_16_MAX_VAL}})",
+            f"&(*{result_var}).Intmax4_UINT_16_MAX_count, ZCBOR_CUSTOM_CAST_FP(zcbor_uint16_{lit_p_func}), state, (&(uint16_t){{INTMAX4_UINT_16_MAX_VAL}})",
+            f"&(*{result_var}).Intmax4_INT_32_MIN_count, ZCBOR_CUSTOM_CAST_FP(zcbor_int32_{lit_p_func}), state, (&(int32_t){{INTMAX4_INT_32_MIN_VAL}})",
+            f"&(*{result_var}).Intmax4_INT_32_MAX_count, ZCBOR_CUSTOM_CAST_FP(zcbor_uint32_{lit_p_func}), state, (&(uint32_t){{INTMAX4_INT_32_MAX_VAL}})",
+            f"&(*{result_var}).Intmax4_UINT_32_MAX_count, ZCBOR_CUSTOM_CAST_FP(zcbor_uint32_{lit_p_func}), state, (&(uint32_t){{INTMAX4_UINT_32_MAX_VAL}})",
+            f"&(*{result_var}).Intmax4_INT_64_MIN_count, ZCBOR_CUSTOM_CAST_FP(zcbor_int64_{lit_p_func}), state, (&(int64_t){{INTMAX4_INT_64_MIN_VAL}})",
+            f"&(*{result_var}).Intmax4_INT_64_MAX_count, ZCBOR_CUSTOM_CAST_FP(zcbor_uint64_{lit_p_func}), state, (&(uint64_t){{INTMAX4_INT_64_MAX_VAL}})",
+            f"&(*{result_var}).Intmax4_UINT_64_MAX_count, ZCBOR_CUSTOM_CAST_FP(zcbor_uint64_{lit_p_func}), state, (&(uint64_t){{INTMAX4_UINT_64_MAX_VAL}}),",
+            f"zcbor_int16_{lit_func}(state, (INTMAX5_INT_8_MIN_PLUS1_VAL))",
+            f"zcbor_uint8_{lit_func}(state, (INTMAX5_INT_8_MAX_PLUS1_VAL))",
+            f"zcbor_uint16_{lit_func}(state, (INTMAX5_UINT_8_MAX_PLUS1_VAL))",
+            f"zcbor_int32_{lit_func}(state, (INTMAX5_INT_16_MIN_PLUS1_VAL))",
+            f"zcbor_uint16_{lit_func}(state, (INTMAX5_INT_16_MAX_PLUS1_VAL))",
+            f"zcbor_uint32_{lit_func}(state, (INTMAX5_UINT_16_MAX_PLUS1_VAL))",
+            f"zcbor_int64_{lit_func}(state, (INTMAX5_INT_32_MIN_PLUS1_VAL))",
+            f"zcbor_uint32_{lit_func}(state, (INTMAX5_INT_32_MAX_PLUS1_VAL))",
+            f"zcbor_uint64_{lit_func}(state, (INTMAX5_UINT_32_MAX_PLUS1_VAL))",
             f"zcbor_int16_{mode}(state, (&(*{result_var}).Intmax6_INT_8_PLUS1)",
             f"zcbor_int16_{mode}(state, (&(*{result_var}).Intmax6_UINT_8_PLUS1)",
             f"zcbor_int32_{mode}(state, (&(*{result_var}).Intmax6_INT_16_PLUS1)",
@@ -1392,20 +1547,41 @@ class TestIntSize(PopenTest, TempdTest):
             f"zcbor_uint{bit_size}_{mode}(state, (&(*{result_var}).DefaultInt_uint)",
         ]
 
+        if defines_arg == []:
+            # Create expected_output_code_lit for use when not using --defines
+            # Replace usage of defined constants with their literal values
+            expected_output_code_lit = []
+            for e in expected_output_code:
+                e2 = e
+                for n, v in expected_defines.items():
+                    e2 = e2.replace(n, v)
+                expected_output_code_lit.append(e2)
+
         output_c = (self.tempd / "src" / f"intmax_{mode}.c").read_text()
+        output_h = (self.tempd / "include" / f"intmax_{mode}.h").read_text()
         output_h_types = (self.tempd / "include" / "intmax_types.h").read_text()
 
         for e in expected_output_types:
             self.assertIn(e, output_h_types, f"Expected '{e}' in output_h_types")
-        for e in expected_output_code:
-            self.assertIn(e, output_c, f"Expected '{e}' in output_c")
+
+        if defines_arg == []:
+            for n, v in expected_defines.items():
+                self.assertNotIn(f"#define {n} ({v})", output_h, f"Expected no '{e}' in output_h")
+            for e in expected_output_code_lit:
+                self.assertIn(e, output_c, f"Expected '{e}' in output_c")
+        else:
+            for n, v in expected_defines.items():
+                self.assertIn(f"#define {n} ({v})", output_h, f"Expected '{e}' in output_h")
+            for e in expected_output_code:
+                self.assertIn(e, output_c, f"Expected '{e}' in output_c")
 
     def test_int_size(self):
         """Test that the correct integer types are generated for different bit sizes."""
 
         for mode in ("decode", "encode"):
-            for bit_size in (8, 16, 32, 64):
-                self.do_test_int_size(mode, bit_size)
+            for defines_arg in ([], ["--defines"]):
+                for bit_size in (8, 16, 32, 64):
+                    self.do_test_int_size(mode, defines_arg, bit_size)
 
 
 class TestCanonical(PopenTest):
@@ -1516,19 +1692,20 @@ class TestExceptions(TestCase):
             zcbor.CodeGenerator.from_cddl(
                 cddl_string=cddl_string,
                 mode="decode",
-                default_max_qty=16,
                 entry_type_names=["test"],
                 default_bit_size=32,
             )
         return cm.exception
 
     def test_exception_formatting(self):
-        failing_cddl_string = 'test = [foo: .size 3 "bar"]'
+        failing_cddl_string = 'test = [foo: .size 3 "bar"] // int'
         expected_error = """
 CDDL parsing error:
-Cannot have size before type: 3
-  while parsing CDDL: '3'
+Cannot have .size before type
+  while parsing CDDL: '.size 3 "bar"'
   while parsing CDDL: 'foo: .size 3 "bar"'
+  while parsing CDDL: '[foo: .size 3 "bar"]'
+  while parsing CDDL: '[foo: .size 3 "bar"] // int'
   while parsing type test""".strip()
         self.assertEqual(
             expected_error, zcbor.format_parsing_error(self.do_test_exception(failing_cddl_string))
@@ -1560,13 +1737,9 @@ Cannot have size before type: 3
             "Type of .default value does not match type of element. (BSTR != UINT)", str(exc)
         )
 
-    def test_range(self):
-        exc = self.do_test_exception("foo = 2..1")
-        self.assertEqual("Range has larger minimum than maximum (min 2, max 1)", str(exc))
-
     def test_label(self):
         exc = self.do_test_exception("foo = uint bar:")
-        self.assertEqual("Cannot have label after type: bar", str(exc))
+        self.assertEqual("Cannot have two types: UINT, OTHER", str(exc))
 
     def test_quantifier_placement(self):
         exc = self.do_test_exception("foo = uint +")
@@ -1574,10 +1747,14 @@ Cannot have size before type: 3
 
     def test_size_placement(self):
         exc = self.do_test_exception("foo = .size 2 uint")
-        self.assertEqual("Cannot have size before type: 2", str(exc))
+        self.assertEqual("Cannot have .size before type", str(exc))
 
     def test_size_type(self):
         exc = self.do_test_exception("foo = nil .size 2")
+        self.assertEqual(".size cannot be applied to NIL", str(exc))
+
+    def test_size_type(self):
+        exc = self.do_test_exception("foo = nil .size 2..4")
         self.assertEqual(".size cannot be applied to NIL", str(exc))
 
     def test_size_value(self):
@@ -1589,8 +1766,10 @@ Cannot have size before type: 3
         self.assertEqual("Integers must have size from 0 to 8, not 10.", str(exc))
 
     def test_cbor_bstr(self):
-        exc = self.do_test_exception("foo = tstr .cbor int")
-        self.assertEqual(".cbor must be used with bstr.", str(exc))
+        exc1 = self.do_test_exception("foo = tstr .cbor int")
+        exc2 = self.do_test_exception("foo = tstr .cborseq int")
+        self.assertEqual(".cbor and .cborseq must be used with bstr.", str(exc1))
+        self.assertEqual(".cbor and .cborseq must be used with bstr.", str(exc2))
 
     def test_bits_int(self):
         exc = self.do_test_exception("foo = int .bits bar")
@@ -1598,7 +1777,7 @@ Cannot have size before type: 3
 
     def test_duplicate_key(self):
         exc = self.do_test_exception("foo = 1 => 2 => tstr")
-        self.assertEqual("Cannot have two keys: //UINT1 and //UINT1 => //UINT2", str(exc))
+        self.assertEqual("Cannot have two keys: //UINT1 and //UINT2", str(exc))
 
     def test_group_key(self):
         exc = self.do_test_exception("foo = (1, 2) => tstr")
@@ -1608,10 +1787,14 @@ Cannot have size before type: 3
 
     def test_list_key(self):
         exc = self.do_test_exception("foo = [1 => tstr]")
-        self.assertEqual(
-            f"""LIST[   //UINT1 => TSTR]{linesep}List member(s) cannot have key: [//UINT1 => TSTR] pointing to []""",
+        self.assertRegex(
             str(exc),
+            rf"""LIST\[\n? +\(//UINT1\) => TSTR(,\n)? *]\r?\nList member\(s\) cannot have key: \[\(//UINT1\) => TSTR] pointing to \[]""",
         )
+
+    def test_multiple_keys(self):
+        exc = self.do_test_exception("foo = 1 => (2 => tstr)")
+        self.assertEqual("Element already has key.", str(exc))
 
     def test_unparsed(self):
         exc = self.do_test_exception("foo = bar")
@@ -1626,11 +1809,201 @@ Cannot have size before type: 3
 
     def test_control_group_member_type(self):
         exc = self.do_test_exception("foo = &(1, int)")
-        self.assertEqual("control group members must be literal positive integers.", str(exc))
+        self.assertRegex(
+            str(exc),
+            r"control group member INT of GROUP\[(.|[\s])*?\] must be literal positive integer\.",
+        )
 
     def test_float_size(self):
         exc = self.do_test_exception("foo = float .size 2..9")
         self.assertEqual("Floats must have 2, 4 or 8 bytes of precision.", str(exc))
+
+    def test_default_type_mismatch(self):
+        exc = self.do_test_exception("foo = ?uint .default -1")
+        self.assertEqual(
+            "Type of .default value does not match type of element. (UINT != NINT)", str(exc)
+        )
+
+    def test_default_type_unsupported(self):
+        exc = self.do_test_exception("foo = ?[uint] .default 1")
+        self.assertEqual("zcbor does not support .default values for the LIST type", str(exc))
+
+    def test_default_union_no_match(self):
+        exc = self.do_test_exception("foo = ?(10 / nint / bstr / 'hello1' / \"hello\") .default 'hello'")
+        self.assertEqual(".default value does not match any member of the union.", str(exc))
+
+    def test_double_default(self):
+        exc = self.do_test_exception("foo = (?uint .default 1) .default 2")
+        self.assertEqual("Element already has .default.", str(exc))
+
+    def test_ambigouous_default(self):
+        exc = self.do_test_exception("""three_to_four = (3..4)
+               foo = ?int .default three_to_four""")
+        self.assertEqual(".default cannot have: range.", str(exc))
+
+
+class TestCodeGeneration(TestCase):
+    def do_test_code_generation(self, cddl_string, entry_type_names=["test"], **kwargs):
+        return zcbor.CodeGenerator.from_cddl(
+            cddl_string=cddl_string,
+            mode="decode",
+            entry_type_names=entry_type_names,
+            default_bit_size=32,
+            **kwargs,
+        )
+
+    def test_duplicate_declarations(self):
+        cddl_string = "test = {int=>[tstr]}"
+        res = self.do_test_code_generation(cddl_string).my_types["test"].type_def()
+        self.assertEqual(1, len(res))
+        self.assertEqual(2, len(res[0]))
+        self.assertEqual("struct test", res[0][1])
+        self.assertEqual(4, len(res[0][0]))
+        self.assertEqual("struct {", res[0][0][0])
+        self.assertEqual("\tint32_t test_tstr_l_key;", res[0][0][1])
+        self.assertEqual("\tstruct zcbor_string test_tstr_l_tstr;", res[0][0][2])
+        self.assertEqual("}", res[0][0][3])
+
+    def test_no_struct_for_literal_key(self):
+        cddl_string = 'test = {? "image" => uint}'
+        types = self.do_test_code_generation(cddl_string)
+        res = types.my_types["test"].type_def()
+        self.assertEqual(1, len(res))
+        self.assertEqual("struct test", res[0][1])
+        self.assertEqual(4, len(res[0][0]))
+        self.assertEqual("struct {", res[0][0][0])
+        self.assertEqual("\tuint32_t test_image;", res[0][0][1])
+        self.assertEqual("\tbool test_image_present;", res[0][0][2])
+        self.assertEqual("}", res[0][0][3])
+
+        entry = types.my_types["test"].value[0]
+        self.assertFalse(entry.repeated_type_def_condition())
+        # The literal key still has to be matched at runtime, so the entry must keep its
+        # own xcoder function even though it no longer needs a struct.
+        self.assertTrue(entry.repeated_single_func_impl_condition())
+
+    def test_struct_for_stored_key(self):
+        cddl_string = "test = {? int => uint}"
+        res = self.do_test_code_generation(cddl_string).my_types["test"].type_def()
+        self.assertEqual(2, len(res))
+        self.assertEqual("struct test_intuint_r", res[0][1])
+        self.assertEqual(4, len(res[0][0]))
+        self.assertEqual("struct {", res[0][0][0])
+        self.assertEqual("\tint32_t test_intuint_key;", res[0][0][1])
+        self.assertEqual("\tuint32_t test_intuint;", res[0][0][2])
+        self.assertEqual("}", res[0][0][3])
+
+    def test_backup_for_repeated_keyed_group(self):
+        cddl_string = "group1 = 3*3 (uint => tstr, nint => bstr)\ntest = {1*3 group1}"
+        types = self.do_test_code_generation(cddl_string)
+        entry = types.my_types["test"].value[0]
+        self.assertEqual("OTHER", entry.type)
+
+        # The group needs no wrapping struct of its own, ...
+        self.assertFalse(entry.repeated_type_def_condition())
+        self.assertEqual("struct group1", entry.repeated_type_name())
+
+        # ... but each repetition can still fail partway through, so it must be decoded
+        # via its own function and with a backup to rewind to. This is what the
+        # GROUP/UNION branch of key_var_condition() is there for; dropping that branch
+        # silently turns the multi_decode() below into the variant without a backup.
+        self.assertTrue(entry.repeated_single_func_impl_condition())
+        self.assertTrue(entry.multi_decode_w_backup_condition())
+
+    def test_float_range_check_condition1(self):
+        cddl_string = "test = ? 1.0..10.0"
+        res = self.do_test_code_generation(cddl_string)
+        self.assertTrue(res.my_types["test"].range_check_condition())
+        self.assertFalse(res.my_types["test"].safe_failable())
+
+    def test_float_range_check_condition2(self):
+        cddl_string = "test = ? float .ge 1.0"
+        res = self.do_test_code_generation(cddl_string)
+        self.assertFalse(res.my_types["test"].safe_failable())
+
+    def test_float_range_check_condition3(self):
+        cddl_string = "Foo = float .ge 1.0\ntest = ? Foo"
+        res = self.do_test_code_generation(cddl_string)
+        self.assertTrue(res.my_types["Foo"].range_check_condition())
+        self.assertFalse(res.my_types["test"].safe_failable())
+
+    def test_float_range_optional_uses_present_decode_w_backup(self):
+        cddl_string = "test = ? float .ge 1.0"
+        res = self.do_test_code_generation(cddl_string)
+        code = res.my_types["test"].full_xcode(res_var=res.my_types["test"].full_result_var())
+        self.assertIn("zcbor_present_decode_w_backup", code)
+        self.assertNotIn("zcbor_float_decode(state", code)
+
+    def test_float_range_union_not_safe_failable(self):
+        cddl_string = "test = ? (1.0..5.0 / 6.0..10.0)"
+        res = self.do_test_code_generation(cddl_string)
+        self.assertFalse(res.my_types["test"].safe_failable())
+
+    def test_transparent_list_decodes_into_result_directly(self):
+        """Transparent LIST wrappers should decode into (*result), not a named field."""
+        test = self.do_test_code_generation("test = [val: int]").my_types["test"]
+        code = test.xcode(res_var=test.full_result_var())
+        self.assertIn("zcbor_int32_decode(state, (&(*result)))", code)
+        self.assertNotIn("(*result).test", code)
+
+    def test_opaque_list_calls_child_decode_function(self):
+        """A LIST wrapping a multi-member GROUP should call the child decoder on (*result)."""
+        cddl_string = "Inner = (a: int, b: int)\ntest = [Inner]"
+        test = self.do_test_code_generation(cddl_string).my_types["test"]
+        code = test.xcode(res_var=test.full_result_var())
+        self.assertIn("decode_Inner(state, (&(*result)))", code)
+
+    def test_unordered_map_codegen_uses_map_search(self):
+        """Unordered map decode must generate zcbor_unordered_map_search without error."""
+        cddl_string = p_unordered_map.read_text(encoding="utf-8")
+        res = self.do_test_code_generation(
+            cddl_string, entry_type_names=["UnorderedMap1"], unordered_maps=True
+        )
+        unordered_map1 = res.my_types["UnorderedMap1"]
+        code = unordered_map1.xcode(res_var=unordered_map1.full_result_var())
+        self.assertIn("zcbor_unordered_map_search", code)
+
+    def test_optional_safe_assign_inlines_decode(self):
+        """Simple safe optionals should assign present from an inlined primitive decode."""
+        test = self.do_test_code_generation("test = ?opt: bool").my_types["test"]
+        code = test.full_xcode(res_var=test.full_result_var())
+        self.assertTrue(test.safe_failable())
+        self.assertIn("test_opt_present = ((zcbor_bool_decode(state", code)
+        self.assertNotIn("zcbor_present_decode", code)
+
+    def test_optional_group_present_decode_uses_repeated_function(self):
+        """Optionals with a repeated decoder must not inline decode in full_xcode()."""
+        test = self.do_test_code_generation("test = ? (a: int, b: int)").my_types["test"]
+        self.assertTrue(test.repeated_single_func_impl_condition())
+        code = test.full_xcode(res_var=test.full_result_var())
+        self.assertIn("ZCBOR_CUSTOM_CAST_FP(decode_repeated_test)", code)
+        self.assertNotIn("zcbor_list_start_decode(state)", code)
+
+    def test_optional_assign_calls_repeated_function_when_safe_failable(self):
+        """The assign path is not valid when repeated_single_func_impl_condition() is True"""
+        test = self.do_test_code_generation("test = ? (a: int, b: int)").my_types["test"]
+        self.assertTrue(test.repeated_single_func_impl_condition())
+        with patch.object(type(test), "safe_failable", return_value=True):
+            with self.assertRaises(AssertionError):
+                test.full_xcode(res_var=test.full_result_var())
+
+    def test_comment_parsing_ignores_semicolon_in_string(self):
+        """Comments should not be parsed inside strings."""
+        cddl_string = """test = "foo;
+        bar" ; comment"""
+        res = self.do_test_code_generation(cddl_string).my_types["test"]
+        self.assertEqual(
+            res.value,
+            """foo;
+        bar""",
+        )
+
+    def test_comment_parsing_ignores_quotes_in_comment(self):
+        """Comments should not be parsed inside strings."""
+        cddl_string = """test = ;"foo"
+        "bar" """
+        res = self.do_test_code_generation(cddl_string).my_types["test"]
+        self.assertEqual(res.value, "bar")
 
 
 class TestUnicodeEscape(TestCase):
@@ -1747,6 +2120,306 @@ class TestControlGroups(TestCase):
         self.assertEqual(8, cddl.decode_str_yaml("8"))
         with self.assertRaises(zcbor.CddlValidationError):
             cddl.decode_str_yaml("1")
+
+
+def cp_from_cddl(cddl):
+    return zcbor.CddlParser.from_cddl(cddl_string=cddl)
+
+
+class TestParsingErrors(TestCase):
+    def cddl_parsing_error_test(self, invalid_cddl, valid_cddl, message_regex=None):
+        """Check that invalid CDDL raises an error and check that a valid CDDL variant passes."""
+        self.assertTrue(cp_from_cddl(valid_cddl))
+        if message_regex is not None:
+            self.assertRaisesRegex(zcbor.CddlParsingError, message_regex, cp_from_cddl, invalid_cddl)
+        else:
+            self.assertRaises(zcbor.CddlParsingError, cp_from_cddl, invalid_cddl)
+
+    def test_invalid_op(self):
+        self.cddl_parsing_error_test(
+            "foo = int .bar 1234", "foo = int .lt 1234", r"Invalid control operator: '\.bar'"
+        )
+
+    def test_invalid_eq(self):
+        self.cddl_parsing_error_test("foo = 1 .eq 2", "foo = int .eq 2", r".*Attempting to set value.*")
+        self.cddl_parsing_error_test(
+            f"foo = int .eq uint",
+            f"foo = int .eq 1000000",
+            r".eq value must be unambiguous\.",
+        )
+        self.cddl_parsing_error_test(
+            "foo = float .eq 2",
+            "foo = float .eq 2.0",
+            r"Type of \.eq value does not match type of element\. \(FLOAT != UINT\)",
+        )
+        self.cddl_parsing_error_test(
+            "foo = uint .eq -1",
+            "foo = nint .eq -1",
+            r"Type of \.eq value does not match type of element\. \(UINT != NINT\)",
+        )
+        self.cddl_parsing_error_test(
+            "foo = nint .eq 0",
+            "foo = int .eq 0",
+            r"Type of \.eq value does not match type of element\. \(NINT != UINT\)",
+        )
+
+    def test_invalid_default(self):
+        self.cddl_parsing_error_test(
+            'foo = ?int .default "hello"',
+            'foo = ?tstr .default "hello"',
+            r"Type of \.default value does not match type of element",
+        )
+        self.cddl_parsing_error_test(
+            f"foo = ?int .default uint",
+            f"foo = ?int .default 1000000",
+            r".default must be unambiguous\.",
+        )
+        self.cddl_parsing_error_test(
+            'foo = tstr .default "hello"',
+            'foo = ?tstr .default "hello"',
+            r"zcbor currently supports \.default only with the \? quantifier",
+        )
+        self.cddl_parsing_error_test(
+            "foo = ?tstr .default bar bar = baz baz = bar",
+            'foo = ?tstr .default "hello"',
+            r"Circular reference detected when unpacking .default",
+        )
+        self.cddl_parsing_error_test(
+            "foo = ?tstr .default bar bar = baz baz = bar",
+            'foo = ?tstr .default "hello"',
+            r"Circular reference detected when unpacking .default",
+        )
+
+    def test_invalid_map_key(self):
+        self.cddl_parsing_error_test("foo = {int}", "foo = {1 => int}", r"Missing map key")
+        self.cddl_parsing_error_test(
+            "bar = (int) foo = {bar}", "bar = (1 => int) foo = {bar}", r"Missing map key"
+        )
+
+    def test_invalid_size(self):
+        self.cddl_parsing_error_test(
+            f"foo = int .size uint",
+            f"foo = int .size 1",
+            r".size operator must have a literal value or range\.",
+        )
+        self.cddl_parsing_error_test(
+            f"foo = int .size -2",
+            f"foo = int .size 2",
+            r".size must be one of \('UINT',\), got NINT\.",
+        )
+        self.cddl_parsing_error_test(
+            "foo = float .size 2.0",
+            "foo = float .size 2",
+            r".size must be one of \('UINT',\), got FLOAT\.",
+        )
+        self.cddl_parsing_error_test(
+            f"foo = bool .size 1", f"foo = int .size 1", r"\.size cannot be applied to BOOL"
+        )
+        self.cddl_parsing_error_test(
+            f"foo = [] .size 1", f"foo = int .size 1", r"\.size cannot be applied to LIST"
+        )
+
+    def test_invalid_size_range(self):
+        self.cddl_parsing_error_test(
+            "foo = int .size -1 .. 2",
+            "foo = int .size 1 .. 2",
+            r"Size range must be non-negative and min <= max \(got: min -1, max 2\)",
+        )
+        self.cddl_parsing_error_test(
+            f"foo = int .size 1 .. uint",
+            f"foo = int .size 1 .. 2",
+            r"Range value must be unambiguous\.",
+        )
+        self.cddl_parsing_error_test(
+            f"foo = int .size 1..2..",
+            f"foo = int .size 1..2",
+            r"Must have exactly one range specifier '..'/'...': 1..2..",
+        )
+        self.cddl_parsing_error_test(
+            f"foo = int .size 1....2",
+            f"foo = int .size 1...2",
+            r"Must have exactly one range specifier '..'/'...': 1....2",
+        )
+        self.cddl_parsing_error_test(
+            "foo = ?bstr .size 0..10 .default '' .cborseq *int",
+            "foo = ?bstr .size 0..10 .default ''",
+            r"zcbor does not support \.default and \.cbor\(seq\) together",
+        )
+        self.cddl_parsing_error_test(
+            "foo = ?bstr .size 0..10 .default '' .cbor *int",
+            "foo = ?bstr .size 0..10 .default ''",
+            r"zcbor does not support \.default and \.cbor\(seq\) together",
+        )
+
+    def test_invalid_inequality(self):
+        for ctrl_op in (".lt", ".gt", ".ge", ".le"):
+            self.cddl_parsing_error_test(
+                f"foo = bool {ctrl_op} 1",
+                f"foo = int {ctrl_op} 1",
+                r"Inequality value must be applied to a number, got BOOL",
+            )
+            self.cddl_parsing_error_test(
+                f"foo = [] {ctrl_op} 1",
+                f"foo = int {ctrl_op} 1",
+                r"Inequality value must be applied to a number, got LIST",
+            )
+            self.cddl_parsing_error_test(
+                f"foo = 1 {ctrl_op} 1",
+                f"foo = int {ctrl_op} 1",
+                r"Inequality value is not needed when value is known: 1",
+            )
+            self.cddl_parsing_error_test(
+                f"foo = int {ctrl_op} 2.0",
+                f"foo = int {ctrl_op} 2",
+                r"Inequality value for integer must be UINT or NINT, got FLOAT\.",
+            )
+            self.cddl_parsing_error_test(
+                f"foo = uint {ctrl_op} 2.0",
+                f"foo = uint {ctrl_op} 2",
+                r"Inequality value for integer must be same type \(UINT\), got FLOAT\.",
+            )
+            self.cddl_parsing_error_test(
+                f"foo = float {ctrl_op} true",
+                f"foo = float {ctrl_op} 1.0",
+                r"Inequality value must be one of \('FLOAT', 'UINT', 'NINT'\), got BOOL\.",
+            )
+            self.cddl_parsing_error_test(
+                f"foo = int {ctrl_op} uint",
+                f"foo = int {ctrl_op} 1",
+                r"Inequality value must be unambiguous\.",
+            )
+            self.cddl_parsing_error_test(
+                f"foo = int {ctrl_op} 1 {ctrl_op} 2",
+                f"foo = int {ctrl_op} 1",
+                rf"Element already has {ctrl_op}\.",
+            )
+            self.cddl_parsing_error_test(
+                f"""
+                foo = int {ctrl_op} bar
+                bar = +#6.123(3)
+                """,
+                f"""
+                foo = int {ctrl_op} bar
+                bar = 3
+                """,
+                r"Inequality value cannot have: (tag, quantifier|quantifier, tag)",
+            )
+            self.cddl_parsing_error_test(
+                f"foo = int {ctrl_op} 3..4",
+                f"foo = int {ctrl_op} 3",
+                r"Inequality value cannot have: range.",
+            )
+
+    def test_invalid_num_range(self):
+        """Check that invalid CDDL with a range of numbers raises an error."""
+        self.cddl_parsing_error_test(
+            "foo = 1..0", "foo = 0..1", r"Range has larger min \(1\) than max \(0\)"
+        )
+        self.cddl_parsing_error_test(
+            "foo = int .gt 3 .size 2..9",
+            "foo = int .gt 3 .size 2..4",
+            "Integers must have size from 0 to 8, not 9.",
+        )
+        self.cddl_parsing_error_test(
+            "foo = 0..1..",
+            "foo = 0..1",
+            r"Must have exactly one range specifier '\.\.'/'\.\.\.': 0..1..",
+        )
+        self.cddl_parsing_error_test(
+            "foo = -1.0..2", "foo = -1.0..2.0", r"Range values must both be int or both float."
+        )
+        self.cddl_parsing_error_test(
+            "foo = 1..2.0", "foo = 1..2", r"Range values must both be int or both float."
+        )
+        self.cddl_parsing_error_test(
+            "foo = 2..1", "foo = 0..1", r"Range has larger min \(2\) than max \(1\)"
+        )
+        self.cddl_parsing_error_test(
+            "foo = 3.0...3.0",
+            "foo = 3.0..3.0",
+            r"Range with equal min and max must be inclusive \(got 3.0, exclusive\)",
+        )
+
+
+class OtherTests(TestCase):
+    def test_unions1(self):
+        parsed = cp_from_cddl("NestedUnion = (1 // (2 // 3))").my_types["NestedUnion"]
+        self.assertEqual(2, len(parsed.value))
+
+    def test_unions2(self):
+        parsed = cp_from_cddl("""NestedUnion2 = [#6.12345(bstr) // #6.23456("foo//bar")]""")
+        parsed = parsed.my_types["NestedUnion2"]
+        self.assertEqual(2, len(parsed.value[0].value))
+
+    def test_ctrl_ops1(self):
+        parsed = cp_from_cddl("foo = ?bstr .cbor [int, tstr] .size 0..50")
+        parsed = parsed.my_types["foo"]
+        self.assertEqual("BSTR", parsed.type)
+        self.assertEqual(0, parsed.min_qty)
+        self.assertEqual(1, parsed.max_qty)
+        self.assertEqual(0, parsed.min_size)
+        self.assertEqual(50, parsed.max_size)
+        self.assertEqual("LIST", parsed.cbor.type)
+        self.assertEqual(2, len(parsed.cbor.value))
+
+    def test_ctrl_ops2(self):
+        parsed = cp_from_cddl("foo = uint .size 2..4 .gt 3 .le 1000000").my_types["foo"]
+        parsed = parsed.my_types["foo"]
+        self.assertEqual("UINT", parsed.type)
+        self.assertEqual(2, parsed.min_size)
+        self.assertEqual(3, parsed.max_size)
+        self.assertEqual(2**8, parsed.min_value)
+        self.assertEqual(1000000, parsed.max_value)
+
+    def test_default1(self):
+        parsed = cp_from_cddl("foo = ?int .default 42").my_types["foo"]
+        self.assertEqual("INT", parsed.type)
+        self.assertEqual(42, parsed.default.value)
+
+    def test_default2(self):
+        parsed = cp_from_cddl("foo = ?bool .default false").my_types["foo"]
+        self.assertEqual("BOOL", parsed.type)
+        self.assertEqual(False, parsed.default.value)
+
+    def test_default3(self):
+        parsed = cp_from_cddl("foo = ?([1, 2, 3] / [*tstr]) .default [1, 2, 3]").my_types["foo"]
+        self.assertEqual("UNION", parsed.type)
+        self.assertEqual("LIST", parsed.value[0].type)
+        self.assertEqual("LIST", parsed.default.type)
+        self.assertEqual(3, len(parsed.default.value))
+        self.assertEqual("UINT", parsed.default.value[2].type)
+        self.assertEqual(3, parsed.default.value[2].value)
+
+    def test_default4(self):
+        # Test that these don't raise an error
+        cp_from_cddl("foo = ?(false / 0) .default false").my_types["foo"]
+        cp_from_cddl("foo = ?(false / 0) .default 0").my_types["foo"]
+
+    def test_nested_map_tstr_keys1(self):
+        cddl = """foo = {"map1": {"map2": uint, "map3": uint}}"""
+        parsed = cp_from_cddl(cddl).my_types["foo"]
+        self.assertEqual("MAP", parsed.type)
+        self.assertEqual(1, len(parsed.value))
+        self.assertEqual("MAP", parsed.value[0].type)
+        self.assertEqual(2, len(parsed.value[0].value))
+        self.assertEqual("map1", parsed.value[0].key.value)
+        self.assertEqual("UINT", parsed.value[0].value[0].type)
+        self.assertEqual("map2", parsed.value[0].value[0].key.value)
+        self.assertEqual("UINT", parsed.value[0].value[1].type)
+        self.assertEqual("map3", parsed.value[0].value[1].key.value)
+
+    def test_nested_map_tstr_keys2(self):
+        cddl = r"""foo = {"\"map1\"": {"\"map2\"": uint,}}"""
+        parsed = cp_from_cddl(cddl).my_types["foo"]
+        self.assertEqual("MAP", parsed.type)
+        self.assertEqual(1, len(parsed.value))
+        self.assertEqual("MAP", parsed.value[0].type)
+        self.assertEqual(1, len(parsed.value[0].value))
+        self.assertEqual('\\"map1\\"', parsed.value[0].key.value)
+        self.assertEqual(6, parsed.value[0].key.size)
+        self.assertEqual("UINT", parsed.value[0].value[0].type)
+        self.assertEqual('\\"map2\\"', parsed.value[0].value[0].key.value)
+        self.assertEqual(6, parsed.value[0].value[0].key.size)
 
 
 if __name__ == "__main__":

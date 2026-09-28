@@ -88,6 +88,31 @@ ZCBOR_STATE_D(decode_state, n, payload, payload_len, elem_count, n_flags);
 ZCBOR_STATE_E(encode_state, n, payload, payload_len, 0);
 ```
 
+Fragmented payloads
+-------------------
+
+zcbor can encode and decode payloads in sections, i.e. the payload can be split into separate buffers/arrays.
+This can be useful e.g. if you send or receive your payload in multiple packets.
+When the current payload section is done, call `zcbor_update_state()` to introduce the next section.
+Note that zcbor does not allow section boundaries to fall anywhere within a zcbor header/value pair.
+This means that the following elements cannot be split between sections:
+
+- Numbers and simple values (integers, floats, bools, undefined, nil)
+- Tags
+- Headers of lists, maps, tstrs, and bstrs
+
+If your payload is split in an unsupported way, you can get around it by making a small section out of the remaining bytes of one section spliced with the start of the next.
+Another option is to leave a little room at the start of each section buffer, and copy the remaining end of one section into the start of the next buffer.
+8 bytes should be enough for this.
+
+Lists and maps can span multiple sections, as long as the individual elements are not split as to break the above rule.
+
+String payloads can be split across multiple payload sections, if `ZCBOR_FRAGMENTS` is enabled, and the `*str_fragments_*()` APIs are used. Note that in the zcbor docs, the term "string fragment" is used for fragmented strings, while the term "payload section" is used for fragmented CBOR payloads, as passed to `zcbor_update_state()`. These do not always line up perfectly, particularly at the start and end of fragmented strings.
+
+CBOR-encoded bstrs can be nested, and there can also be a non-CBOR-encoded innermost string.
+The current innermost string (CBOR-encoded or otherwise) is called the "current string".
+`zcbor_update_state()` modifies all backups so that outer nested CBOR-encoded strings have updated information about the new section.
+
 Configuration
 -------------
 
@@ -103,6 +128,7 @@ Name                      | Description
 `ZCBOR_STOP_ON_ERROR`     | Enable the `stop_on_error` functionality. Note that it also has to be enabled in the state variable (`state->constant_state->stop_on_error`). This makes all zcbor functions abort their execution if called when an error has already happened.
 `ZCBOR_BIG_ENDIAN`        | All decoded values are returned as big-endian. The default is little-endian.
 `ZCBOR_MAP_SMART_SEARCH`  | Applies to decoding of unordered maps. When enabled, a flag is kept for each element in an array, ensuring it is not processed twice. If disabled, a count is kept for map as a whole. Enabling increases code size and memory usage, and requires the state variable to possess the memory necessary for the flags.
+`ZCBOR_FRAGMENTS`         | Enable functions for decoding and encoding byte and text strings in fragments.
 
 Canonical encoding
 ------------------
@@ -187,6 +213,7 @@ The following data types are supported by CBOR, but not by YAML (or JSON which i
  2. map keys other than text string: In YAML, such key value pairs are represented as `{"zcbor_keyval<unique int>": {"key": <key, not text>, "val": <value>}}`.
  3. tags: In cbor2, tags are represented by a special type, `cbor2.CBORTag`. In YAML, these are represented as `{"zcbor_tag": <tag number>, "zcbor_tag_val": <tagged data>}`.
  4. undefined: In cbor2, undefined has its own value `cbor2.types.undefined`. In YAML, undefined is represented as: `["zcbor_undefined"]`.
+ 5. floats: In cbor2, floats are always encoded as float64, unless the value can be losslessly represented as float16 or float32. In YAML, a specific float precision can be forced by using `{"zcbor_float16": <value>}`, `{"zcbor_float32": <value>}`, or `{"zcbor_float64": <value>}`.
 
 You can see an example of the conversions in [tests/cases/yaml_compatibility.yaml](tests/cases/yaml_compatibility.yaml) and its CDDL file [tests/cases/yaml_compatibility.cddl](tests/cases/yaml_compatibility.cddl).
 
@@ -514,7 +541,7 @@ usage: zcbor code [-h] -c CDDL [--no-prelude] [-v] [-q]
                   -t ENTRY_TYPES [ENTRY_TYPES ...] [-d] [-e] [--time-header]
                   [--git-sha-header] [-b {8,16,32,64}]
                   [--include-prefix INCLUDE_PREFIX] [-s]
-                  [--file-header FILE_HEADER]
+                  [--file-header FILE_HEADER] [--defines] [--unordered-maps]
 
 Parse a CDDL file and produce C code that validates and xcodes CBOR.
 The output from this script is a C file and a header file. The header file
@@ -617,6 +644,20 @@ options:
                         generated files, e.g. copyright. Can be a string or a
                         path to a file. If interpreted as a path to an
                         existing file, the file's contents will be used.
+  --defines             Make #defines for all magic numbers in generated code,
+                        and place them in the generated header file. This is
+                        off by default because it may create naming conflicts
+                        that don't show up otherwise.
+  --unordered-maps      [EXPERIMENTAL] Generate code in such a way that it can
+                        decode maps with unknown element order. When enabled,
+                        the generated code will use the
+                        zcbor_unordered_map_*() API to decode data whenever
+                        inside a map. zcbor detects from the CDDL whether
+                        ZCBOR_MAP_SMART_SEARCH is needed and enables it in the
+                        generated cmake file if so. Enabling --unordered-maps
+                        places some restrictions on the level of ambiguity
+                        allowed between map keys in a map. This option only
+                        affects decoding (--decode/-d).
 
 ```
 

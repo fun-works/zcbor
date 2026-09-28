@@ -4,11 +4,16 @@
 ; SPDX-License-Identifier: Apache-2.0
 ;
 
+One = 1
+Two = 2
+Three = 3
+Hundred = 100
+
 Numbers = [
-	one: 1,
+	one: One,
 	minustwo: -2,
 	fourtoten: 4..10,
-	twobytes: uint .size 2,
+	twobytes: uint .size Two,
 	onetofourbytes: uint .size 0b1..0o4, ; Testing binary and octal
 	minusfivektoplustwohundred: -5000..200,
 	fourbillion: 0xEE6B2800,
@@ -39,10 +44,12 @@ NumberMap = {
 	? "opt_cbor" => bstr .size 5 .cbor (uint .size 4),
 }
 
+TenToThirty = 10..30
+
 Strings = [
 	hello: "hello",
 	threehundrebytebstr: bstr .size 300,
-	#6.0(tentothirtybytetstr: tstr .size 10..30),
+	#6.0(tentothirtybytetstr: tstr .size TenToThirty),
 	cborNumbers: bstr .cbor Numbers,
 	cborseqSimples: bstr .cborseq Simples,
 	?optCborStrings: bstr .cbor Strings,
@@ -72,9 +79,9 @@ MultiGroup = +(3,-4)
 Union = Group / MultiGroup / (3,4) / "\"hello\""
 
 Map = {
-	listkey: [5,6] => bool,
+	listkey: ((([5,6] => bool))),
 	union: (7=>uint) / (-8=>uint),
-	twotothree: 2*3 nil => bstr,
+	twotothree: (2*3 (nil => bstr)),
 }
 
 EmptyMap = {}
@@ -96,6 +103,8 @@ Range = [
 	+multi0to10: 0..0x0A, ; Testing hexadecimal
 ]
 
+euler = (2.72)
+
 ValueRange = [
 	greater10: uint .gt 10,
 	less1000: int .lt 1000,
@@ -103,10 +112,28 @@ ValueRange = [
 	lesseq1: uint .le 1,
 	equal42: uint .eq 42,
 	equalstrworld: tstr .eq "world",
-	default3: ?int .gt 2 .default 3,
-	defaulthello: ?bstr .default 'hello',
-	defaulte: ?float .size 4 .default 2.72,
+	equalpi: float .size 8 .eq ((( 3.14 ))),
+	equaltrue: bool .eq true,
+	default3: ?int .gt 2 .default Three,
+	defaulthello: ?bstr .default ((('hello'))),
+	defaulte: ?float .size 4 .default euler,
 	defaultfalse: ?bool .default false,
+]
+
+le100ge100le = Hundred
+le100ge100ge = Hundred
+
+ValueRange2 = [
+	le100ge100: uint .le le100ge100le .ge le100ge100ge,
+	gt49lt51: uint .gt 49 .lt 51,
+]
+
+FloatOne = 1.0
+
+FloatRange = [
+	min4to1: -4.2...FloatOne,
+	min6milToMin1: -6543210.0..-0.99,
+	zeroTo100: 0.0..100.0,
 ]
 
 SingleBstr = bstr
@@ -117,7 +144,7 @@ SingleInt2 = uint .lt 10
 
 Unabstracted = [
 	unabstractedunion1: (choice1: 1 // choice2: 2),
-	(unabstractedunion2: 3 / choice4: 4)
+	(unabstractedunion2: 3 / (choice4: 4))
 ]
 
 QuantityRange = (
@@ -145,7 +172,7 @@ Floats = [
 
 ; Test using ranges (greater/less than) on floats.
 Floats2 = [
-	float_lt_1: float .lt 1,
+	float_lt_1: float .lt 1.0,
 	float_ge_min_10000: float .ge -10000,
 ]
 
@@ -313,7 +340,7 @@ BstrSize = {
 }
 bstr12 = ("s" : bstr .size 12)
 
-; found in https://github.com/NordicSemiconductor/zcbor/pull/398
+; found in https://github.com/nordicsemi/zcbor/pull/398
 MapUnionPrimAlias = {
 	(0: 0) /
 	(1: int) /
@@ -440,3 +467,80 @@ AmbigList = [
 	intlist: *[+int],
 	tstrlist: [+int, +tstr],
 ]
+
+UnionDefault = [
+	int,
+	foo: ?((FooA: 1) / (FooB: 2) / (FooC: Three)) .default (Three),
+	bar: ?((BarA: [+int]) / (noBar: nil)) .default nil,
+	baz: ?((BazA: []) / (BazB: [+bstr] / (BazC: [+tstr]))) .default [],
+]
+
+OptUnion = [foo: ?((FooA: 1) / (FooB: 2) / (FooC: Three))]
+CountUnion = (+1) / nil
+
+Tags = [
+	tag1: ((tag1_alt1: #6.1234(int)) / (tag1_alt2: #6.2345(int))),
+	tag2: ((tag2_alt1: (#6.3456(bool), #6.1234(int))) / (tag2_alt2: #6.3456(bool))),
+]
+
+map1 = {"1": int}
+map2 = {"2": int}
+map3 = {"2": int, "3": int}
+
+TwoMaps = [ ?map1, map2 ]
+BstrMapUnion = (bstr .cbor map1 / bstr .cbor map2)
+AmbigMap = (map1 / map2 / map3)
+
+InnerPair = (left: int, right: int)
+InnerPairOpt = ?(left: int, right: int)
+WrapListGroup = [InnerPair]
+WrapListGroupOpt1 = [inner1: ?InnerPair]
+WrapListGroupOpt2 = [inner2: InnerPairOpt]
+WrapListGroupOptMult = ?[*(inner: InnerPair)]
+OptCbor = [?(cbor: bstr .cbor int)]
+BstrMap = bstr .cbor map1
+
+; Optional float with range: decode must restore state when range check fails.
+OptFloatThenInt = [
+	?optfloat: float .ge 1.0 .le 10.0,
+	mandint: int,
+]
+
+; Optional float union with ranged branches: second branch must be tried after first fails.
+OptFloatUnion = [foo: ?((oneToFive: 1.0..5.0) / (sixToTen: 6.0..10.0))]
+
+CborBstrList = [?bstr .cbor [int, tstr]]
+
+MapOptElem1 = (MapOptElemRoot)
+
+MapOptElemRoot = {
+    first     : ("a" => bstr),
+    second    : ("b" => bstr),
+    ?third    : ("c" => bstr),
+}
+
+MapIndirect = {
+ 0: Group1,
+ 1: ((zero: 0) / (one: 1))
+}
+
+Group1 = (
+ (zero: 0) / (one: 1)
+)
+
+MapOptElem2 = {
+ 0: Map1,
+ 1: Map2Opt,
+}
+
+Map1 = {
+ 0: int,
+}
+
+Map2Opt = {
+ ? 0: int,
+}
+
+Map3Inner = {"1": int}
+
+Map3 = { "inner": [Map3Inner] }
