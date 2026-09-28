@@ -10,6 +10,10 @@ find_package(Zephyr REQUIRED HINTS $ENV{ZEPHYR_BASE})
 project(test5_corner_cases)
 include(../../cmake/test_template.cmake)
 
+if (TEST_DEFINES)
+  set(defines_arg --defines)
+endif()
+
 set(py_command
   ${PYTHON_EXECUTABLE}
   ${CMAKE_CURRENT_LIST_DIR}/../../../zcbor/zcbor.py
@@ -19,6 +23,7 @@ set(py_command
   --output-c ${PROJECT_BINARY_DIR}/src/corner_cases.c
   --output-h ${PROJECT_BINARY_DIR}/include/corner_cases.h
   --copy-sources
+  ${defines_arg}
   -t NestedListMap NestedMapListMap
     Numbers
     Numbers2
@@ -33,6 +38,8 @@ set(py_command
     Level1
     Range
     ValueRange
+    ValueRange2
+    FloatRange
     SingleBstr
     SingleInt
     SingleInt2
@@ -66,6 +73,26 @@ set(py_command
     OptList
     UnicodeEscape
     AmbigList
+    UnionDefault
+    OptUnion
+    CountUnion
+    Tags
+    TwoMaps
+    BstrMapUnion
+    AmbigMap
+    WrapListGroup
+    WrapListGroupOpt1
+    WrapListGroupOpt2
+    WrapListGroupOptMult
+    OptCbor
+    BstrMap
+    OptFloatUnion
+    OptFloatThenInt
+    CborBstrList
+    MapOptElem1
+    MapIndirect
+    MapOptElem2
+    Map3
   --decode
   --git-sha-header
   --short-names
@@ -90,7 +117,4 @@ if (TEST_INDEFINITE_LENGTH_ARRAYS)
   target_compile_definitions(app PUBLIC TEST_INDEFINITE_LENGTH_ARRAYS)
 endif()
 
-if (NOT VERBOSE AND CONFIG_MINIMAL_LIBC)
-  # VERBOSE means including printk which doesn't build with these options.
-  target_compile_options(corner_cases PRIVATE -Wpedantic -Wconversion -Wdouble-promotion)
-endif()
+target_compile_options(corner_cases PRIVATE -Wall -Wpedantic -Wconversion -Wdouble-promotion -Wshadow -Wnull-dereference -Wduplicated-cond -Wlogical-op -Wstrict-overflow=2 -Wpointer-arith)

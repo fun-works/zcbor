@@ -4,8 +4,8 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 
-cmake_minimum_required(VERSION 3.13.3)
-project (sample_hello_world)
+cmake_minimum_required(VERSION 3.13.1)
+project(sample_hello_world)
 
 set(zcbor_src ../../src)
 add_executable(${PROJECT_NAME}
